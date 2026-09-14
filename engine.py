@@ -217,12 +217,15 @@ TEAM_HINTS = {
     "paris saint germain": "paris sg",
     "sporting cp": "sporting lisbon",
     "sporting lisbon": "sp lisbon",
+    "estrela da amadora": "estrela",
+    "cf estrela": "estrela",
 }
 
 _CACHE: OrderedDict[str, dict] = OrderedDict()
 _CRESTS = {}
 _HTTP_MEM = {}
 _FIXTURE_MEM = {}
+_LIVE_BOARD = {"expires": 0.0, "rows": []}
 MAX_LEAGUE_CACHE = 2
 MAX_HTTP_MEM = 24
 MAX_FIXTURE_MEM = 8
@@ -409,7 +412,18 @@ def map_to_catalog(name: str, catalog: list[str]) -> str | None:
     via_hint = match_team(hinted, catalog)
     if via_hint:
         return via_hint
-    return match_team(name, catalog)
+    via_name = match_team(name, catalog)
+    if via_name:
+        return via_name
+    query_tokens = set(folded.split())
+    nested = [
+        item
+        for item in catalog
+        if fold_name(item) and set(fold_name(item).split()) <= query_tokens
+    ]
+    if len(nested) == 1:
+        return nested[0]
+    return None
 
 
 def resolve_tz(tz_name: str | None):
@@ -531,6 +545,8 @@ def league_fixtures(
         if status.get("cancelled") or status.get("finished"):
             continue
         item = fixture_dict(match, catalog, now, league_id)
+        item["league_id"] = league_id
+        item["league_name"] = league["name"]
         kickoff = parse_iso(item["kickoff"])
         if item["status"] == "live":
             live.append(item)
@@ -567,6 +583,56 @@ def league_fixtures(
         "next_matches": next_matches,
         "upcoming": upcoming_rest[:12],
         "carousel": carousel[:16],
+    }
+
+
+def live_matches_for_league(league: dict, now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now(timezone.utc)
+    payload = fotmob_league_payload(
+        league["fotmob_id"],
+        league.get("season") if league["kind"] == "fotmob" else None,
+    )
+    live = []
+    for match in (payload.get("fixtures") or {}).get("allMatches") or []:
+        status = match.get("status") or {}
+        if status.get("cancelled") or status.get("finished"):
+            continue
+        item = fixture_dict(match, None, now, league["id"])
+        if item["status"] != "live":
+            continue
+        item["league_id"] = league["id"]
+        item["league_name"] = league["name"]
+        item["country"] = league["country"]
+        live.append(item)
+    live.sort(key=lambda item: item["kickoff"] or "")
+    return live
+
+
+def get_live_board(tz_name: str | None = None) -> dict:
+    tz = resolve_tz(tz_name)
+    now = datetime.now(timezone.utc)
+    if _LIVE_BOARD["expires"] > time.time():
+        rows = _LIVE_BOARD["rows"]
+    else:
+        def one(league: dict) -> list[dict]:
+            try:
+                return live_matches_for_league(league, now)
+            except Exception:
+                return []
+
+        rows = []
+        for group in _HTTP.map(one, LEAGUES):
+            rows.extend(group)
+        rows.sort(
+            key=lambda item: (item.get("league_name") or "", item.get("kickoff") or "")
+        )
+        _LIVE_BOARD["rows"] = rows
+        _LIVE_BOARD["expires"] = time.time() + FOTMOB_LIVE_TTL
+    return {
+        "as_of": now.astimezone(tz).isoformat(),
+        "timezone": getattr(tz, "key", str(tz)),
+        "count": len(rows),
+        "live": rows,
     }
 
 

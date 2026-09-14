@@ -187,6 +187,48 @@ select {
 }
 .fx-card.is-live .fx-meta { color: var(--danger); }
 
+.live-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 10px;
+}
+.live-board .fx-card {
+  flex: none;
+  width: 100%;
+  min-height: 168px;
+}
+.fx-league {
+  margin-bottom: 8px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+.live-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.live-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 0 rgba(224, 122, 106, 0.7);
+  animation: live-pulse 1.6s ease-out infinite;
+}
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(224, 122, 106, 0.55); }
+  70% { box-shadow: 0 0 0 8px rgba(224, 122, 106, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(224, 122, 106, 0); }
+}
+
 details.custom {
   border-top: 1px solid var(--line);
   margin-top: 14px;

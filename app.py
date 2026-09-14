@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from engine import LEAGUES, build_prediction, get_fixtures, get_league_state
+from engine import LEAGUES, build_prediction, get_fixtures, get_league_state, get_live_board
 
 ROOT = Path(__file__).resolve().parent
 app = FastAPI(title="Football Predictor")
@@ -21,6 +21,11 @@ class PredictRequest(BaseModel):
 @app.get("/")
 def index():
     return FileResponse(ROOT / "static" / "index.html")
+
+
+@app.get("/api/live")
+def live(tz: str | None = None):
+    return get_live_board(tz)
 
 
 @app.get("/api/leagues")

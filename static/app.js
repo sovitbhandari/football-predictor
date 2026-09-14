@@ -12,10 +12,13 @@ const custom = $("custom");
 
 let leagueMeta = {};
 let carousel = [];
+let liveMatches = [];
 let selectedKey = "";
 let paintedLeague = "";
 let predictToken = 0;
+let teamsToken = 0;
 let predictAbort = null;
+let liveTimer = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -70,7 +73,15 @@ function when(iso, mode = "full") {
 }
 
 function fixtureKey(match) {
-  return `${match.home}|${match.away}|${match.kickoff || ""}`;
+  return `${match.league_id || ""}|${match.home}|${match.away}|${match.kickoff || ""}`;
+}
+
+function sameTeams(match, homeName, awayName) {
+  if (!match || !homeName || !awayName) return false;
+  return (
+    (match.home === homeName && match.away === awayName)
+    || (match.home_source === homeName && match.away_source === awayName)
+  );
 }
 
 function params() {
@@ -107,13 +118,17 @@ function cardState(match) {
   return "Upcoming";
 }
 
-function FixtureCard(match) {
+function FixtureCard(match, { showLeague = false } = {}) {
   const active = fixtureKey(match) === selectedKey ? " is-active" : "";
   const live = match.status === "live" ? " is-live" : "";
+  const leagueLine = showLeague && match.league_name
+    ? `<div class="fx-league">${escapeHtml(match.league_name)}</div>`
+    : "";
   const meta = match.status === "live"
     ? `Live ${match.minute || ""} ${match.score || ""}`.trim()
     : when(match.kickoff, "card");
-  return `<button type="button" class="fx-card${active}${live}" data-key="${escapeHtml(fixtureKey(match))}">
+  return `<button type="button" class="fx-card${active}${live}" data-key="${escapeHtml(fixtureKey(match))}" data-league="${escapeHtml(match.league_id || "")}">
+    ${leagueLine}
     <div class="fx-crest-row">
       ${crest(match.home_logo, match.home)}
       ${crest(match.away_logo, match.away)}
@@ -129,7 +144,14 @@ function FixtureCard(match) {
 
 function FixtureCarousel(matches) {
   if (!matches.length) return `<p class="status">No upcoming fixtures found.</p>`;
-  return `<div class="carousel">${matches.map(FixtureCard).join("")}</div>`;
+  return `<div class="carousel">${matches.map((match) => FixtureCard(match)).join("")}</div>`;
+}
+
+function LiveBoard(matches) {
+  if (!matches.length) {
+    return `<p class="live-empty">No live games in these leagues right now.</p>`;
+  }
+  return `<div class="live-board">${matches.map((match) => FixtureCard(match, { showLeague: true })).join("")}</div>`;
 }
 
 function MatchHeader(data, match) {
@@ -325,7 +347,7 @@ function highlightCarousel() {
     paintCarousel();
     return;
   }
-  $("fixtures").querySelectorAll(".fx-card").forEach((card) => {
+  document.querySelectorAll(".fx-card").forEach((card) => {
     card.classList.toggle("is-active", card.dataset.key === selectedKey);
   });
 }
@@ -337,12 +359,45 @@ function paintCarousel() {
   highlightCarousel();
 }
 
+function paintLiveBoard(asOf) {
+  const count = liveMatches.length;
+  $("live-as-of").innerHTML = count
+    ? `<span class="live-count"><span class="live-dot"></span>${count} live · ${escapeHtml(asOf ? when(asOf) : "now")}</span>`
+    : (asOf ? `As of ${when(asOf)}` : "");
+  $("live-now").innerHTML = LiveBoard(liveMatches);
+  highlightCarousel();
+}
+
+function findInCarousel(homeName, awayName) {
+  return carousel.find((item) => sameTeams(item, homeName, awayName));
+}
+
+function pickTeam(select, name) {
+  if (!name) return false;
+  const values = [...select.options].map((opt) => opt.value);
+  if (values.includes(name)) {
+    select.value = name;
+    return true;
+  }
+  const folded = name.toLowerCase();
+  const hit = values.find((value) => {
+    const other = value.toLowerCase();
+    return folded.includes(other) || other.includes(folded);
+  });
+  if (hit) {
+    select.value = hit;
+    return true;
+  }
+  return false;
+}
+
 async function selectFixture(match, predictNow, fromUser) {
-  if (!match || match.predictable === false) return;
+  if (!match) return;
   selectedKey = fixtureKey(match);
-  if ([...home.options].some((opt) => opt.value === match.home)) home.value = match.home;
-  if ([...away.options].some((opt) => opt.value === match.away)) away.value = match.away;
-  writeParams({ league: league.value, home: match.home, away: match.away });
+  pickTeam(home, match.home) || pickTeam(home, match.home_source);
+  pickTeam(away, match.away) || pickTeam(away, match.away_source);
+  if (!home.value || !away.value || home.value === away.value) return;
+  writeParams({ league: league.value, home: home.value, away: away.value });
   highlightCarousel();
   if (predictNow) {
     if (fromUser) results.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -407,6 +462,7 @@ async function runPredict(match) {
 }
 
 async function loadTeams() {
+  const token = ++teamsToken;
   status.textContent = "Loading fixtures…";
   home.disabled = away.disabled = true;
   results.classList.add("hidden");
@@ -420,13 +476,14 @@ async function loadTeams() {
     if (!r.ok) throw new Error(body.detail || "Could not load teams");
     return body;
   });
+  if (token !== teamsToken) return;
   leagueMeta = data;
   carousel = data.carousel && data.carousel.length
     ? data.carousel
     : [...(data.live || []), ...(data.today || []), ...(data.next_matches || []), ...(data.upcoming || [])];
   const wantedHome = params().get("home");
   const wantedAway = params().get("away");
-  const focus = carousel.find((item) => item.home === wantedHome && item.away === wantedAway)
+  const focus = findInCarousel(wantedHome, wantedAway)
     || data.focus
     || carousel[0];
   setOptions(home, data.teams, (focus && focus.home) || wantedHome || data.teams[0]);
@@ -444,12 +501,51 @@ $("fixtures").addEventListener("click", (event) => {
   if (match) selectFixture(match, true, true);
 });
 
+$("live-now").addEventListener("click", (event) => {
+  const card = event.target.closest(".fx-card");
+  if (!card) return;
+  const match = liveMatches.find((item) => fixtureKey(item) === card.dataset.key);
+  if (match) selectLiveMatch(match).catch((error) => {
+    status.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+  });
+});
+
+async function selectLiveMatch(match) {
+  writeParams({ league: match.league_id, home: match.home, away: match.away });
+  selectedKey = fixtureKey(match);
+  highlightCarousel();
+  if (league.value !== match.league_id) {
+    league.value = match.league_id;
+    await loadTeams();
+    return;
+  }
+  const mapped = findInCarousel(match.home, match.away) || findInCarousel(match.home_source, match.away_source);
+  await selectFixture(mapped || match, true, true);
+}
+
+async function loadLiveBoard() {
+  const query = new URLSearchParams({ tz: localTz });
+  const data = await fetch(`/api/live?${query}`).then(async (r) => {
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || "Could not load live games");
+    return body;
+  });
+  liveMatches = data.live || [];
+  paintLiveBoard(data.as_of);
+}
+
 async function loadLeagues() {
   const data = await fetch("/api/leagues").then((r) => r.json());
   const selected = params().get("league") || data[0]?.id;
   league.innerHTML = data.map((item) =>
     `<option value="${escapeHtml(item.id)}"${item.id === selected ? " selected" : ""}>${escapeHtml(item.name)} · ${escapeHtml(item.country)} · ${escapeHtml(item.season)}</option>`
   ).join("");
+  loadLiveBoard().catch(() => {
+    $("live-now").innerHTML = `<p class="live-empty">Live scores are unavailable right now.</p>`;
+  });
+  if (!liveTimer) liveTimer = window.setInterval(() => {
+    loadLiveBoard().catch(() => {});
+  }, 45000);
   await loadTeams();
 }
 

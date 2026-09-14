@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Match Grid — football predictor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="/static/styles.css?v=2" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="brand">
+      <div>
+        <h1>Match Grid</h1>
+        <p>Dixon–Coles match probabilities with FotMob player rates.</p>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="league-bar">
+        <div>
+          <label for="league">League</label>
+          <select id="league"></select>
+        </div>
+      </div>
+      <p class="status" id="status">Choose a league to load fixtures.</p>
+    </section>
+
+    <section class="card" id="fixtures-card">
+      <div class="carousel-head">
+        <h2 class="section-title" style="margin:0">Fixtures</h2>
+        <span id="as-of"></span>
+      </div>
+      <div id="fixtures"></div>
+      <details class="custom" id="custom">
+        <summary>Custom match / choose teams</summary>
+        <div class="custom-grid">
+          <div>
+            <label for="home">Home</label>
+            <select id="home"></select>
+          </div>
+          <div>
+            <label for="away">Away</label>
+            <select id="away"></select>
+          </div>
+          <button class="btn" id="predict" type="button">Predict</button>
+        </div>
+      </details>
+    </section>
+
+    <div id="results" class="stack hidden">
+      <section class="card" id="hero"></section>
+
+      <section class="card">
+        <h2 class="section-title">Best single picks</h2>
+        <div class="singles" id="singles"></div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">Combo picks</h2>
+        <div class="combos" id="combos"></div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">Most likely exact scores</h2>
+        <div id="scores"></div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">Goalscorer picks</h2>
+        <div class="players" id="scorers"></div>
+        <h2 class="section-title" style="margin-top:18px">Assist picks</h2>
+        <div class="players" id="assists"></div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">Why the model leans this way</h2>
+        <div class="why-grid" id="why"></div>
+      </section>
+
+      <section class="card" id="model-info"></section>
+    </div>
+  </div>
+  <script src="/static/app.js?v=3"></script>
+</body>
+</html>

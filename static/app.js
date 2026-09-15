@@ -607,6 +607,8 @@ function formatApiError(detail) {
   }
   return String(detail);
 }
+
+async function loadTeams() {
   const token = ++teamsToken;
   status.textContent = "Loading fixtures…";
   home.disabled = away.disabled = true;

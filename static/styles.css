@@ -558,6 +558,7 @@ details.custom summary {
   padding: 14px 16px;
 }
 .model-bar b { color: var(--text); font-weight: 600; display: block; margin-bottom: 2px; }
+.model-bar .s { color: var(--muted); font-size: 11px; margin-top: 2px; }
 
 .crest-wrap { display: inline-grid; place-items: center; }
 

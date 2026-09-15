@@ -6,7 +6,7 @@
   <title>Match Grid — football predictor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" />
-  <link rel="stylesheet" href="/static/styles.css?v=4" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
 </head>
 <body>
   <div class="wrap">
@@ -58,21 +58,29 @@
     </section>
 
     <div id="results" class="stack hidden">
+      <section class="card" id="freshness"></section>
       <section class="card" id="hero"></section>
 
       <section class="card">
-        <h2 class="section-title">Best single picks</h2>
+        <h2 class="section-title">Most likely singles</h2>
+        <p class="explain" id="views-note">Ranked by model event probability. Best-value needs bookmaker odds (unavailable).</p>
         <div class="singles" id="singles"></div>
       </section>
 
       <section class="card">
         <h2 class="section-title">Combo picks</h2>
+        <p class="explain" id="combo-note"></p>
         <div class="combos" id="combos"></div>
       </section>
 
       <section class="card">
         <h2 class="section-title">Most likely exact scores</h2>
         <div id="scores"></div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title">Recent form</h2>
+        <div class="why-grid" id="form"></div>
       </section>
 
       <section class="card">
@@ -87,9 +95,14 @@
         <div class="why-grid" id="why"></div>
       </section>
 
+      <section class="card hidden" id="settlement-card">
+        <h2 class="section-title">Prediction vs Actual</h2>
+        <div id="settlement"></div>
+      </section>
+
       <section class="card" id="model-info"></section>
     </div>
   </div>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>

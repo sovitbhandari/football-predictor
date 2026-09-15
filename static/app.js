@@ -193,9 +193,16 @@ function ProbabilityBar(data) {
 function PredictionHero(data, match) {
   const bestScore = data.exact_scores[0];
   const color = data.predicted_result === "home" ? "var(--home)" : data.predicted_result === "away" ? "var(--away)" : "var(--draw)";
+  const kind = data.forecast_kind === "hypothetical_matchup"
+    ? "Hypothetical matchup"
+    : data.forecast_kind === "completed_fixture"
+      ? "Completed fixture"
+      : "Upcoming fixture forecast";
+  const kick = data.kickoff || match?.kickoff;
   return `${MatchHeader(data, match)}
+    <p class="explain" style="margin-top:8px">${escapeHtml(kind)}${kick ? ` · kickoff ${escapeHtml(when(kick))}` : ""}${data.fixture_id ? ` · ${escapeHtml(data.fixture_id)}` : ""}</p>
     <div class="hero-result">
-      <p class="hero-kicker">Most likely match result</p>
+      <p class="hero-kicker">Most likely match result (regulation)</p>
       <p class="hero-label" style="color:${color}">${escapeHtml(data.predicted_result_label).toUpperCase()}</p>
       <p class="hero-prob" style="color:${color}">${pct(data.predicted_result_prob)}</p>
       <p class="hero-note">Aggregate 1X2 from the score grid — not the same as the most likely exact score.</p>
@@ -203,19 +210,21 @@ function PredictionHero(data, match) {
     ${ProbabilityBar(data)}
     <div class="split-2">
       <div class="stat-box">
-        <div class="k">Expected goals</div>
+        <div class="k">Expected goals (Dixon–Coles λ)</div>
         <div class="v">${data.xg_home.toFixed(2)} — ${data.xg_away.toFixed(2)}</div>
-        <div class="s">${escapeHtml(data.home)} / ${escapeHtml(data.away)}</div>
+        <div class="s">${escapeHtml(data.home)} / ${escapeHtml(data.away)} · not shot-based xG</div>
       </div>
       <div class="stat-box">
         <div class="k">Most likely exact score</div>
         <div class="v">${bestScore.home} — ${bestScore.away}</div>
-        <div class="s">${pct(bestScore.prob)} of simulated scorelines</div>
+        <div class="s">${pct(bestScore.prob)} of scoreline mass · top 3 below</div>
       </div>
     </div>`;
 }
 
 function SinglePickCard(pick) {
+  const fair = pick.fair_odds != null ? `Fair ${Number(pick.fair_odds).toFixed(2)}` : "";
+  const value = pick.value_status === "unavailable" ? "Value unavailable" : "";
   return `<article class="pick-card">
     <div class="pick-top">
       <div class="rank">#${pick.rank}</div>
@@ -224,7 +233,7 @@ function SinglePickCard(pick) {
     <div class="sel">${escapeHtml(pick.selection)}</div>
     <div class="market">${escapeHtml(pick.market)}</div>
     <div class="prob">${pct(pick.prob)}</div>
-    <div class="explain">${escapeHtml(pick.explain)}</div>
+    <div class="explain">${escapeHtml(pick.explain || "")}${fair ? ` · ${fair}` : ""}${value ? ` · ${value}` : ""}</div>
   </article>`;
 }
 
@@ -232,16 +241,88 @@ function ComboCard(title, combo) {
   if (!combo) return "";
   const risk = combo.risk || (combo.n === 4 ? "HIGH" : combo.n === 3 ? "MEDIUM" : "LOWER");
   const legs = (combo.legs || String(combo.label || "").split(" + ")).filter(Boolean);
+  const fair = combo.fair_odds != null ? `Fair ${Number(combo.fair_odds).toFixed(2)}` : "";
   return `<article class="combo-card">
     <div class="combo-top">
       <div class="combo-title">${escapeHtml(title)}</div>
       <span class="badge ${risk === "HIGH" ? "HIGH-RISK" : risk}">${escapeHtml(risk)}</span>
     </div>
     ${legs.map((leg) => `<div class="leg"><span>${escapeHtml(leg)}</span><span class="check">✓</span></div>`).join("")}
-    <div class="market" style="margin-top:10px">Model probability</div>
+    <div class="market" style="margin-top:10px">Joint model probability</div>
     <div class="prob">${pct(combo.prob)}</div>
-    <div class="explain">${escapeHtml(combo.explain || "Joint probability from scoreline states, not multiplied singles.")}</div>
+    <div class="explain">${escapeHtml(combo.explain || "Joint probability from scoreline states, not multiplied singles.")}${fair ? ` · ${fair}` : ""} · Value unavailable</div>
   </article>`;
+}
+
+function FreshnessBar(data) {
+  const f = data.freshness || {};
+  const lineup = data.lineup || {};
+  const cacheNote = f.from_cache ? "Cached model fit (same data version)" : "Fresh fit for this cutoff";
+  const stale = f.stale ? `<div class="s" style="color:#c45c26">Stale-data notice: showing last valid forecast.</div>` : "";
+  return `<div class="model-bar">
+    <div><b>Forecast generated</b>${escapeHtml(when(f.forecast_generated_at || data.as_of))}</div>
+    <div><b>Results through</b>${escapeHtml(f.results_current_through || "—")}</div>
+    <div><b>Lineup</b>${escapeHtml(lineup.status || "Unavailable")}<div class="s">${escapeHtml(lineup.note || "")}</div></div>
+    <div><b>Cache</b>${escapeHtml(cacheNote)}${stale}</div>
+  </div>`;
+}
+
+function FormWindow(teamBlock) {
+  if (!teamBlock || !teamBlock.windows) {
+    return `<div class="stat-box"><div class="k">${escapeHtml(teamBlock?.team || "Team")}</div><div class="s">${escapeHtml(teamBlock?.note || "No form")}</div></div>`;
+  }
+  const w5 = teamBlock.windows["5"] || {};
+  const w10 = teamBlock.windows["10"] || {};
+  return `<div class="stat-box">
+    <div class="k">${escapeHtml(teamBlock.team)} · recent form</div>
+    <div class="v" style="font-size:16px">L5 ${escapeHtml(w5.record || "—")} · L10 ${escapeHtml(w10.record || "—")}</div>
+    <div class="s">L5 ${w5.points_per_match != null ? w5.points_per_match.toFixed(2) : "—"} PPG · GF/GA ${w5.goals_for != null ? w5.goals_for.toFixed(2) : "—"}/${w5.goals_against != null ? w5.goals_against.toFixed(2) : "—"} · rest ${teamBlock.rest_days ?? "—"}d</div>
+    <div class="s">${escapeHtml(teamBlock.note || "")}</div>
+  </div>`;
+}
+
+function SettlementBlock(data) {
+  const s = data.settlement;
+  if (!s) return "";
+  const actual = s.actual_score || {};
+  const pred = s.predicted_score || {};
+  const singles = (s.singles || []).map((row) =>
+    `<div class="leg"><span>${escapeHtml(row.selection || "")}</span><span>${row.won === true ? "Won" : row.won === false ? "Lost" : "—"}</span></div>`
+  ).join("");
+  const combos = (s.combos || []).map((row) =>
+    `<div class="leg"><span>${escapeHtml(row.label || "")}</span><span>${row.won === true ? "Won" : row.won === false ? "Lost" : "—"}</span></div>`
+  ).join("");
+  return `<div class="stat-box">
+    <div class="k">Frozen pre-kickoff forecast</div>
+    <div class="s">${escapeHtml(when(s.frozen_at))}</div>
+    <div class="metric-row" style="margin-top:10px">
+      <div><b>${pred.home ?? "—"}–${pred.away ?? "—"}</b><small>Predicted exact (${pct(pred.prob || 0)})</small></div>
+      <div><b>${actual.home}–${actual.away}</b><small>Actual regulation</small></div>
+      <div><b>${s.exact_score_hit ? "Hit" : "Miss"}</b><small>Exact score</small></div>
+      <div><b>${s.result_hit ? "Hit" : "Miss"}</b><small>1X2 (${escapeHtml(s.predicted_result_label || "")})</small></div>
+    </div>
+    <div style="margin-top:12px">${singles}${combos}</div>
+    <div class="s" style="margin-top:8px">${escapeHtml(s.note || "")}</div>
+  </div>`;
+}
+
+function ModelInfoBar(data) {
+  const model = data.model_library
+    ? `${data.model || "Dixon–Coles"} · ${data.model_library} ${data.penaltyblog_version || ""}`
+    : (data.model || "Dixon–Coles");
+  const extras = [
+    data.rho != null ? `ρ ${Number(data.rho).toFixed(3)}` : null,
+    data.home_advantage != null ? `home adv ${Number(data.home_advantage).toFixed(2)}` : null,
+    data.xi != null ? `ξ ${data.xi}` : null,
+    data.loglikelihood != null ? `ll ${Number(data.loglikelihood).toFixed(1)}` : null,
+  ].filter(Boolean).join(" · ");
+  const notIn = (data.inputs_not_in_model || []).join(" · ");
+  return `<div class="model-bar">
+    <div><b>Model</b>${escapeHtml(model)}${extras ? `<div class="s">${escapeHtml(extras)}</div>` : ""}</div>
+    <div><b>In the fit</b>${escapeHtml((data.inputs || []).join(" · "))}</div>
+    <div><b>Display only</b>${escapeHtml(notIn || "—")}</div>
+    <div><b>Sample</b>${data.trained_on} matches before cutoff · ${data.current_matches} this season</div>
+  </div>`;
 }
 
 function ExactScoreList(rows) {
@@ -298,36 +379,35 @@ function HeadToHeadList(rows) {
   </div>`;
 }
 
-function ModelInfoBar(data) {
-  return `<div class="model-bar">
-    <div><b>Model</b>${escapeHtml(data.model || "Dixon–Coles")}</div>
-    <div><b>Inputs</b>${escapeHtml((data.inputs || []).join(" · "))}</div>
-    <div><b>Sample</b>${data.trained_on} matches · ${data.current_matches} this season</div>
-    <div><b>Last updated</b>${when(data.as_of)}</div>
-  </div>`;
-}
-
 function skeleton() {
   results.classList.remove("hidden");
+  if ($("freshness")) $("freshness").innerHTML = `<div class="skel" style="min-height:48px"></div>`;
   $("hero").innerHTML = `<div class="skel" style="min-height:240px"></div>`;
-  $("singles").innerHTML = `<div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div>`;
-  $("combos").innerHTML = `<div class="skel"></div><div class="skel"></div><div class="skel"></div>`;
+  $("singles").innerHTML = `<div class="skel"></div><div class="skel"></div><div class="skel"></div>`;
+  $("combos").innerHTML = `<div class="skel"></div><div class="skel"></div>`;
   $("scores").innerHTML = `<div class="skel"></div>`;
+  if ($("form")) $("form").innerHTML = `<div class="skel"></div>`;
   $("scorers").innerHTML = `<div class="skel"></div>`;
   $("assists").innerHTML = `<div class="skel"></div>`;
   $("why").innerHTML = `<div class="skel"></div>`;
+  if ($("settlement-card")) $("settlement-card").classList.add("hidden");
   $("model-info").innerHTML = `<div class="skel" style="min-height:48px"></div>`;
 }
 
 function render(data, match) {
+  if ($("freshness")) $("freshness").innerHTML = FreshnessBar(data);
   $("hero").innerHTML = PredictionHero(data, match);
   $("singles").innerHTML = (data.single_picks || []).map(SinglePickCard).join("") || `<p class="explain">No single picks available.</p>`;
+  if ($("combo-note")) $("combo-note").textContent = data.combo_note || "Joint probabilities from the score grid. Redundant legs are rejected.";
   $("combos").innerHTML = [
     ComboCard("Best 2-leg", data.combo_2leg),
-    ComboCard("Best 3-leg", data.medium_risk),
-    ComboCard("Best 4-leg", data.high_risk),
-  ].join("");
-  $("scores").innerHTML = ExactScoreList(data.exact_scores || []);
+    ComboCard("Best 3-leg", data.combo_3leg || data.medium_risk),
+  ].filter(Boolean).join("") || `<p class="explain">${escapeHtml(data.combo_note || "No valid combos.")}</p>`;
+  $("scores").innerHTML = ExactScoreList((data.exact_scores || []).slice(0, 3));
+  if ($("form")) {
+    const rf = data.recent_form || {};
+    $("form").innerHTML = `${FormWindow(rf.home)}${FormWindow(rf.away)}`;
+  }
   if (data.player_note) {
     $("scorers").innerHTML = `<p class="explain">${escapeHtml(data.player_note)}</p>`;
     $("assists").innerHTML = "";
@@ -340,6 +420,16 @@ function render(data, match) {
     $("assists").innerHTML = assists.map((row) => PlayerPredictionCard(row, "assist")).join("") || `<p class="explain">Not enough minutes yet.</p>`;
   }
   $("why").innerHTML = `${TeamStatComparison(data.home_form)}${TeamStatComparison(data.away_form)}${HeadToHeadList(data.h2h || [])}`;
+  const settleHtml = SettlementBlock(data);
+  if ($("settlement-card")) {
+    if (settleHtml) {
+      $("settlement-card").classList.remove("hidden");
+      $("settlement").innerHTML = settleHtml;
+    } else {
+      $("settlement-card").classList.add("hidden");
+      $("settlement").innerHTML = "";
+    }
+  }
   $("model-info").innerHTML = ModelInfoBar(data);
   results.classList.remove("hidden");
 }
@@ -442,17 +532,28 @@ async function selectFixture(match, predictNow, fromUser) {
   }
 }
 
+function predictBody(match) {
+  const body = {
+    league_id: league.value,
+    home: home.value,
+    away: away.value,
+  };
+  if (match?.fixture_id) body.fixture_id = match.fixture_id;
+  if (match?.kickoff) body.kickoff = match.kickoff;
+  return body;
+}
+
 function prefetchNearby() {
   const index = carousel.findIndex((item) => fixtureKey(item) === selectedKey);
   const nearby = carousel.slice(Math.max(0, index), index + 4);
   nearby.forEach((match) => {
     if (!match || match.predictable === false) return;
-    const key = `${league.value}|${match.home}|${match.away}`;
+    const key = `${league.value}|${match.fixture_id || ""}|${match.home}|${match.away}|${match.kickoff || ""}`;
     if (cache.has(key)) return;
     fetch("/api/predict", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ league_id: league.value, home: match.home, away: match.away }),
+      body: JSON.stringify(predictBody(match)),
     }).then(async (response) => {
       const data = await response.json();
       if (response.ok) cache.set(key, data);
@@ -462,8 +563,8 @@ function prefetchNearby() {
 
 async function runPredict(match) {
   const token = ++predictToken;
-  const key = `${league.value}|${home.value}|${away.value}`;
   const selected = match || carousel.find((item) => item.home === home.value && item.away === away.value);
+  const key = `${league.value}|${selected?.fixture_id || ""}|${home.value}|${away.value}|${selected?.kickoff || ""}`;
   if (cache.has(key)) {
     render(cache.get(key), selected);
     status.textContent = `${leagueMeta.name || ""} ${leagueMeta.season || ""}`;
@@ -480,7 +581,7 @@ async function runPredict(match) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: predictAbort.signal,
-      body: JSON.stringify({ league_id: league.value, home: home.value, away: away.value }),
+      body: JSON.stringify(predictBody(selected)),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "Prediction failed");

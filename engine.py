@@ -7,6 +7,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,7 +17,18 @@ import pandas as pd
 import requests
 from penaltyblog.models import DixonColesGoalModel, dixon_coles_weights
 
+import forecasts as forecast_store
+import form as form_analysis
+from markets import best_combos, rank_single_selections
+
 USER_AGENT = "Mozilla/5.0"
+TRACKING_NOTE = (
+    "Prediction vs Actual is only shown for fixtures this app forecast "
+    "before kickoff after tracking activation. No retrospective backfill."
+)
+# Default Dixon–Coles time-decay (penaltyblog dixon_coles_weights).
+DEFAULT_XI = 0.0018
+MODEL_MAX_GOALS = 15
 EURO_BASE = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 EXTRA_BASE = "https://www.football-data.co.uk/new/{code}.csv"
 FOTMOB_LEAGUE = "https://www.fotmob.com/api/data/leagues?id={league_id}"
@@ -228,7 +240,7 @@ _CRESTS = {}
 _HTTP_MEM = {}
 _FIXTURE_MEM = {}
 _LIVE_BOARD = {"expires": 0.0, "rows": []}
-MAX_LEAGUE_CACHE = 2
+MAX_LEAGUE_CACHE = 6
 MAX_HTTP_MEM = 24
 MAX_FIXTURE_MEM = 8
 _LOCK = threading.Lock()
@@ -505,7 +517,17 @@ def fixture_dict(
     away_name = mapped_away or away
     home_logo = remember_crest(league_id, home_name, match["home"].get("id"))
     away_logo = remember_crest(league_id, away_name, match["away"].get("id"))
+    match_id = match.get("id") or match.get("matchId")
+    fixture_id = (
+        f"{league_id}:{match_id}"
+        if league_id and match_id is not None
+        else None
+    )
+    postponed = bool(status.get("awarded") is False and reason.get("short") in {"Post", "PP"})
     return {
+        "fixture_id": fixture_id,
+        "match_id": match_id,
+        "league_id": league_id,
         "home": home_name,
         "away": away_name,
         "home_source": home,
@@ -515,7 +537,11 @@ def fixture_dict(
         "home_logo": home_logo,
         "away_logo": away_logo,
         "kickoff": kickoff.isoformat() if kickoff else None,
-        "status": "live" if live else "finished" if finished else "scheduled",
+        "venue": (match.get("venue") or {}).get("name") if isinstance(match.get("venue"), dict) else match.get("venue"),
+        "status": "live" if live else "finished" if finished else ("cancelled" if cancelled else "scheduled"),
+        "finished": finished,
+        "cancelled": cancelled,
+        "postponed": postponed,
         "minute": minute or (reason.get("short") if isinstance(reason, dict) else None),
         "score": status.get("scoreStr"),
         "predictable": bool(
@@ -671,74 +697,234 @@ def combo_markets(prediction, home: str, away: str) -> list[tuple[str, float]]:
     return ranked
 
 
+def _joint_mask(masks):
+    mask = masks[0]
+    for extra in masks[1:]:
+        mask = mask & extra
+    return mask
+
+
+def _combo_conflict(a: dict, b: dict) -> bool:
+    if a["id"] == b["id"] or a["family"] == b["family"]:
+        return True
+    families = {a["family"], b["family"]}
+    if families == {"1x2", "dc"}:
+        return True
+    nested = {
+        frozenset({"over_15", "over_25"}),
+        frozenset({"over_15", "over_35"}),
+        frozenset({"over_25", "over_35"}),
+        frozenset({"under_15", "under_25"}),
+        frozenset({"over_15", "under_15"}),
+        frozenset({"over_25", "under_25"}),
+        frozenset({"over_35", "under_25"}),
+        frozenset({"over_35", "under_15"}),
+        frozenset({"btts_yes", "home_win_nil"}),
+        frozenset({"btts_yes", "away_win_nil"}),
+        frozenset({"home_win", "home_win_nil"}),
+        frozenset({"away_win", "away_win_nil"}),
+        frozenset({"home_win", "away_win_nil"}),
+        frozenset({"away_win", "home_win_nil"}),
+        frozenset({"draw", "home_win_nil"}),
+        frozenset({"draw", "away_win_nil"}),
+    }
+    return frozenset({a["id"], b["id"]}) in nested
+
+
+def _combo_ok(legs: list[dict]) -> bool:
+    return all(not _combo_conflict(a, b) for a, b in combinations(legs, 2))
+
+
+def _combo_pack(legs: list[dict], grid, n: int, risk: str, explain: str) -> dict:
+    mask = _joint_mask([leg["mask"] for leg in legs])
+    labels = [leg["label"] for leg in legs]
+    return {
+        "legs": labels,
+        "label": " + ".join(labels),
+        "prob": float(grid[mask].sum()),
+        "n": n,
+        "risk": risk,
+        "explain": explain,
+        "_mask": mask,
+        "_legs": legs,
+    }
+
+
+def _profile_totals(prediction, total) -> dict:
+    xg = float(prediction.home_goal_expectation + prediction.away_goal_expectation)
+    over_35 = float(prediction.total_goals("over", 3.5))
+    over_25 = float(prediction.total_goals("over", 2.5))
+    under_25 = float(prediction.total_goals("under", 2.5))
+    if over_35 >= 0.50:
+        return {
+            "id": "over_35",
+            "family": "totals",
+            "label": "Over 3.5 Goals",
+            "mask": total > 3.5,
+        }
+    if xg >= 2.7 or over_25 >= 0.56:
+        return {
+            "id": "over_25",
+            "family": "totals",
+            "label": "Over 2.5 Goals",
+            "mask": total > 2.5,
+        }
+    if xg <= 2.2 or under_25 >= 0.55:
+        return {
+            "id": "under_25",
+            "family": "totals",
+            "label": "Under 2.5 Goals",
+            "mask": total < 2.5,
+        }
+    return {
+        "id": "over_15",
+        "family": "totals",
+        "label": "Over 1.5 Goals",
+        "mask": total > 1.5,
+    }
+
+
+def _combo_leg_pool(prediction, home: str, away: str) -> list[dict]:
+    grid = prediction.grid
+    home_goals, away_goals = np.indices(grid.shape)
+    total = home_goals + away_goals
+    btts = (home_goals > 0) & (away_goals > 0)
+    home_win = home_goals > away_goals
+    draw = home_goals == away_goals
+    away_win = home_goals < away_goals
+    pool = [
+        {"id": "home_win", "family": "1x2", "label": f"{home} win", "mask": home_win},
+        {"id": "draw", "family": "1x2", "label": "Draw", "mask": draw},
+        {"id": "away_win", "family": "1x2", "label": f"{away} win", "mask": away_win},
+        {
+            "id": "dc_1x",
+            "family": "dc",
+            "label": f"{home} or Draw",
+            "mask": home_win | draw,
+        },
+        {
+            "id": "dc_x2",
+            "family": "dc",
+            "label": f"{away} or Draw",
+            "mask": away_win | draw,
+        },
+        {"id": "over_15", "family": "totals", "label": "Over 1.5 Goals", "mask": total > 1.5},
+        {"id": "over_25", "family": "totals", "label": "Over 2.5 Goals", "mask": total > 2.5},
+        {"id": "over_35", "family": "totals", "label": "Over 3.5 Goals", "mask": total > 3.5},
+        {"id": "under_25", "family": "totals", "label": "Under 2.5 Goals", "mask": total < 2.5},
+        {"id": "under_15", "family": "totals", "label": "Under 1.5 Goals", "mask": total < 1.5},
+        {"id": "btts_yes", "family": "btts", "label": "BTTS — Yes", "mask": btts},
+        {"id": "btts_no", "family": "btts", "label": "BTTS — No", "mask": ~btts},
+        {
+            "id": "home_over_15",
+            "family": "home_goals",
+            "label": f"{home} over 1.5 goals",
+            "mask": home_goals > 1.5,
+        },
+        {
+            "id": "away_over_15",
+            "family": "away_goals",
+            "label": f"{away} over 1.5 goals",
+            "mask": away_goals > 1.5,
+        },
+        {
+            "id": "home_win_nil",
+            "family": "win_nil",
+            "label": f"{home} win to nil",
+            "mask": home_win & (away_goals == 0),
+        },
+        {
+            "id": "away_win_nil",
+            "family": "win_nil",
+            "label": f"{away} win to nil",
+            "mask": away_win & (home_goals == 0),
+        },
+    ]
+    for _prob, goals_h, goals_a in top_scores(prediction, 3):
+        pool.append(
+            {
+                "id": f"exact_{goals_h}_{goals_a}",
+                "family": "exact",
+                "label": f"Exact {goals_h}-{goals_a}",
+                "mask": (home_goals == goals_h) & (away_goals == goals_a),
+            }
+        )
+    return pool
+
+
 def multi_leg_picks(prediction, home: str, away: str) -> tuple[dict, dict]:
     grid = prediction.grid
     home_goals, away_goals = np.indices(grid.shape)
     total = home_goals + away_goals
-    home_win, draw, away_win = (
-        float(prediction.home_win),
-        float(prediction.draw),
-        float(prediction.away_win),
-    )
+    pool = _combo_leg_pool(prediction, home, away)
+    by_id = {leg["id"]: leg for leg in pool}
 
-    if home_win >= away_win and home_win >= draw:
-        result = (f"{home} win", home_goals > away_goals)
-        favorite = home
-        favorite_goals = home_goals
-    elif away_win >= home_win and away_win >= draw:
-        result = (f"{away} win", home_goals < away_goals)
-        favorite = away
-        favorite_goals = away_goals
+    result_side, _result_label, _prob = predicted_1x2(prediction, home, away)
+    result = by_id[{"home": "home_win", "away": "away_win", "draw": "draw"}[result_side]]
+    totals = _profile_totals(prediction, total)
+
+    third_choices = [
+        leg
+        for leg in pool
+        if leg["id"] not in {result["id"], totals["id"]}
+        and _combo_ok([result, totals, leg])
+    ]
+    best_third = None
+    for leg in third_choices:
+        mask = _joint_mask([result["mask"], totals["mask"], leg["mask"]])
+        prob = float(grid[mask].sum())
+        if best_third is None or prob > best_third[0]:
+            best_third = (prob, leg)
+
+    if best_third is None:
+        btts = by_id["btts_yes" if float(prediction.btts_yes) >= 0.5 else "btts_no"]
+        three = [result, btts, totals]
     else:
-        result = ("Draw", home_goals == away_goals)
-        favorite = None
-        favorite_goals = None
+        three = [result, totals, best_third[1]]
 
-    btts_mask = (home_goals > 0) & (away_goals > 0)
-    btts = (
-        ("BTTS — Yes", btts_mask)
-        if float(prediction.btts_yes) >= 0.5
-        else ("BTTS — No", ~btts_mask)
-    )
-    over_25 = float(prediction.total_goals("over", 2.5))
-    totals = (
-        ("Over 2.5 Goals", total > 2.5)
-        if over_25 >= 0.5
-        else ("Under 2.5 Goals", total < 2.5)
+    medium = _combo_pack(
+        three,
+        grid,
+        3,
+        "MEDIUM",
+        "Anchored to the Dixon–Coles 1X2, then the totals line and extra market with the highest joint probability on this match’s score grid.",
     )
 
-    three = [result, btts, totals]
-    three_mask = three[0][1] & three[1][1] & three[2][1]
-    medium = {
-        "legs": [item[0] for item in three],
-        "label": " + ".join(item[0] for item in three),
-        "prob": float(grid[three_mask].sum()),
-        "n": 3,
-        "risk": "MEDIUM",
-    }
+    remain = [leg for leg in pool if leg["id"] not in {item["id"] for item in three}]
+    best_fourth = None
+    three_prob = medium["prob"]
+    for leg in remain:
+        if not _combo_ok(three + [leg]):
+            continue
+        mask = medium["_mask"] & leg["mask"]
+        prob = float(grid[mask].sum())
+        if prob < 0.02 or prob >= three_prob - 1e-12:
+            continue
+        if best_fourth is None or prob > best_fourth[0]:
+            best_fourth = (prob, leg)
 
-    if totals[0] == "Over 2.5 Goals":
-        fourth = ("Over 3.5 Goals", total > 3.5)
-    elif btts[0] == "BTTS no" and favorite is not None:
-        clean_sheet = away_goals == 0 if favorite == home else home_goals == 0
-        fourth = (f"{favorite} win to nil", result[1] & clean_sheet)
-    elif favorite is not None:
-        fourth = (f"{favorite} over 1.5 goals", favorite_goals > 1.5)
+    if best_fourth is None:
+        exact_p, goals_h, goals_a = top_scores(prediction, 1)[0]
+        fourth = {
+            "id": f"exact_{goals_h}_{goals_a}",
+            "family": "exact",
+            "label": f"Exact {goals_h}-{goals_a}",
+            "mask": (home_goals == goals_h) & (away_goals == goals_a),
+        }
     else:
-        _prob, goals_h, goals_a = top_scores(prediction, 1)[0]
-        fourth = (
-            f"Exact {goals_h}-{goals_a}",
-            (home_goals == goals_h) & (away_goals == goals_a),
-        )
+        fourth = best_fourth[1]
 
-    four_mask = three_mask & fourth[1]
-    high = {
-        "legs": [item[0] for item in three] + [fourth[0]],
-        "label": " + ".join([item[0] for item in three] + [fourth[0]]),
-        "prob": float(grid[four_mask].sum()),
-        "n": 4,
-        "risk": "HIGH",
-    }
+    high = _combo_pack(
+        three + [fourth],
+        grid,
+        4,
+        "HIGH",
+        "Same 3-leg, tightened with the extra market that most reduces the Dixon–Coles score grid without becoming implied.",
+    )
+    medium.pop("_mask", None)
+    medium.pop("_legs", None)
+    high.pop("_mask", None)
+    high.pop("_legs", None)
     return medium, high
 
 
@@ -1159,84 +1345,157 @@ def players_as_dicts(frame: pd.DataFrame) -> list[dict]:
     return rows
 
 
-def venue_stats(matches: pd.DataFrame, team: str, venue: str) -> dict:
-    if venue == "home":
-        games = matches[matches["home"] == team]
-        scored, conceded = games["goals_home"], games["goals_away"]
-    else:
-        games = matches[matches["away"] == team]
-        scored, conceded = games["goals_away"], games["goals_home"]
-    if games.empty:
-        return {"team": team, "venue": venue, "games": 0, "scored": 0.0, "conceded": 0.0}
-    return {
-        "team": team,
-        "venue": venue,
-        "games": int(len(games)),
-        "scored": float(scored.mean()),
-        "conceded": float(conceded.mean()),
+def dixon_coles_meta(model) -> dict:
+    meta = {
+        "model": "Dixon–Coles",
+        "model_library": "penaltyblog",
+        "model_class": f"{type(model).__module__}.{type(model).__name__}",
+        "penaltyblog_version": __import__("penaltyblog").__version__,
+        "xi": DEFAULT_XI,
+        "max_goals": MODEL_MAX_GOALS,
     }
+    params = getattr(model, "params", None)
+    if isinstance(params, dict):
+        mapping = params
+    else:
+        names = getattr(model, "param_names", None) or getattr(model, "_param_names", None)
+        mapping = None
+        if params is not None and names is not None:
+            try:
+                mapping = dict(zip(list(names), np.asarray(params).ravel()))
+            except (TypeError, ValueError):
+                mapping = None
+    if mapping:
+        for key in ("rho", "home_advantage"):
+            if key not in mapping:
+                continue
+            try:
+                meta[key] = float(np.asarray(mapping[key]).reshape(-1)[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+    for attr in ("aic", "loglikelihood", "fitted"):
+        if hasattr(model, attr):
+            value = getattr(model, attr)
+            if value is not None and not callable(value):
+                try:
+                    meta[attr] = float(value) if attr != "fitted" else bool(value)
+                except (TypeError, ValueError):
+                    meta[attr] = value
+    return meta
 
 
-def fit_league(league: dict) -> dict:
+def training_cutoff(kickoff: str | None, now: datetime | None = None) -> datetime:
+    """Use regulation kickoff as the hard information boundary when known."""
+    now = now or datetime.now(timezone.utc)
+    if not kickoff:
+        return now
+    try:
+        kick = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
+    except ValueError:
+        return now
+    if kick.tzinfo is None:
+        kick = kick.replace(tzinfo=timezone.utc)
+    kick = kick.astimezone(timezone.utc)
+    return min(now, kick)
+
+
+def fit_league(
+    league: dict,
+    cutoff: datetime | None = None,
+    xi: float = DEFAULT_XI,
+) -> dict:
     matches = load_league(league)
     if matches.empty:
         raise ValueError(f"No completed matches found for {league['name']}.")
-    current = matches[matches["season"] == league["season"]]
-    if current.empty:
+    cut = cutoff or datetime.now(timezone.utc)
+    dates = pd.to_datetime(matches["date"], utc=True)
+    trainable = matches.loc[dates < cut].copy()
+    if trainable.empty:
         raise ValueError(
-            f"No {league['season_label']} matches found for {league['name']} yet."
+            f"No completed matches before forecast cutoff for {league['name']}."
+        )
+    current = trainable[trainable["season"] == league["season"]]
+    if current.empty:
+        # Do not silently train only on prior season as if it were current.
+        raise ValueError(
+            f"No {league['season_label']} matches before cutoff for {league['name']}. "
+            "Refusing to substitute older-season-only strengths."
         )
     weights = np.array(
-        dixon_coles_weights(matches["date"].tolist()),
+        dixon_coles_weights(trainable["date"].tolist(), xi=xi),
         dtype=float,
         copy=True,
     )
     model = DixonColesGoalModel(
         *arrays(
-            matches["goals_home"].to_numpy(dtype=int),
-            matches["goals_away"].to_numpy(dtype=int),
-            matches["home"].to_numpy(dtype=str),
-            matches["away"].to_numpy(dtype=str),
+            trainable["goals_home"].to_numpy(dtype=int),
+            trainable["goals_away"].to_numpy(dtype=int),
+            trainable["home"].to_numpy(dtype=str),
+            trainable["away"].to_numpy(dtype=str),
             weights,
         )
     )
     model.fit()
-    teams = sorted(set(current["home"]) | set(current["away"]))
+    season_teams = sorted(
+        set(matches.loc[matches["season"] == league["season"], "home"])
+        | set(matches.loc[matches["season"] == league["season"], "away"])
+    )
+    latest_match = pd.to_datetime(trainable["date"], utc=True).max()
     return {
         "league": league,
         "matches": matches,
+        "trainable": trainable,
         "current": current,
-        "teams": teams,
+        "teams": season_teams,
         "model": model,
         "players": None,
         "player_error": None,
-        "trained_on": len(matches),
+        "trained_on": len(trainable),
         "current_matches": len(current),
-        "prior_matches": len(matches) - len(current),
+        "prior_matches": int((trainable["season"] != league["season"]).sum()),
+        "cutoff": cut.isoformat(),
+        "xi": xi,
+        "results_through": latest_match.date().isoformat(),
+        "data_version": f"{league['id']}|{latest_match.isoformat()}|{len(trainable)}|{xi}",
     }
 
 
-def get_league_state(league_id: str) -> dict:
+def get_league_state(
+    league_id: str,
+    cutoff: datetime | None = None,
+    xi: float = DEFAULT_XI,
+) -> dict:
+    cut = cutoff or datetime.now(timezone.utc)
+    # Bucket cutoffs to the hour so we do not refit on every click.
+    cut_key = cut.astimezone(timezone.utc).strftime("%Y%m%d%H")
+    cache_key = f"{league_id}|{cut_key}|{xi}"
     with _LOCK:
-        cached = _CACHE.get(league_id)
+        cached = _CACHE.get(cache_key)
         if cached is not None:
-            _CACHE.move_to_end(league_id)
+            _CACHE.move_to_end(cache_key)
+            cached = dict(cached)
+            cached["from_cache"] = True
             return cached
-        event = _FIT_EVENTS.get(league_id)
+        event = _FIT_EVENTS.get(cache_key)
         if event is None:
             event = threading.Event()
-            _FIT_EVENTS[league_id] = event
+            _FIT_EVENTS[cache_key] = event
             owner = True
         else:
             owner = False
     if not owner:
-        event.wait(timeout=120)
-        return _CACHE[league_id]
-    try:
-        state = fit_league(league_by_id(league_id))
+        event.wait(timeout=180)
         with _LOCK:
-            _CACHE[league_id] = state
-            _CACHE.move_to_end(league_id)
+            cached = _CACHE[cache_key]
+            cached = dict(cached)
+            cached["from_cache"] = True
+            return cached
+    try:
+        state = fit_league(league_by_id(league_id), cutoff=cut, xi=xi)
+        state["from_cache"] = False
+        with _LOCK:
+            _CACHE[cache_key] = state
+            _CACHE.move_to_end(cache_key)
             while len(_CACHE) > MAX_LEAGUE_CACHE:
                 old_id, _ = _CACHE.popitem(last=False)
                 _FIT_EVENTS.pop(old_id, None)
@@ -1260,6 +1519,53 @@ def get_fixtures(league_id: str, tz_name: str | None = None) -> dict:
     return data
 
 
+def find_fixture(
+    league_id: str,
+    home: str,
+    away: str,
+    fixture_id: str | None = None,
+    kickoff: str | None = None,
+) -> dict | None:
+    """Resolve the scheduled FotMob meeting when possible."""
+    try:
+        fixtures = get_fixtures(league_id)
+    except Exception:
+        return None
+    pools = []
+    for key in ("live", "today", "next_matches", "upcoming", "carousel"):
+        pools.extend(fixtures.get(key) or [])
+    if fixtures.get("next"):
+        pools.append(fixtures["next"])
+
+    if fixture_id:
+        for item in pools:
+            if item.get("fixture_id") == fixture_id:
+                return item
+
+    def fold(name: str) -> str:
+        return fold_name(name)
+
+    candidates = [
+        item
+        for item in pools
+        if fold(item.get("home") or "") == fold(home)
+        and fold(item.get("away") or "") == fold(away)
+    ]
+    if kickoff:
+        for item in candidates:
+            if item.get("kickoff") == kickoff:
+                return item
+    # Prefer next scheduled / live, not an arbitrary finished historical card
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            0 if item.get("status") == "live" else 1 if item.get("status") == "scheduled" else 2,
+            item.get("kickoff") or "",
+        ),
+    )
+    return ordered[0] if ordered else None
+
+
 def _warmup_players(league_id: str) -> None:
     try:
         _players_for_state(get_league_state(league_id))
@@ -1280,42 +1586,142 @@ def _players_for_state(state: dict):
             state["player_error"] = str(error)
 
 
-def build_prediction(league_id: str, home: str, away: str) -> dict:
-    state = get_league_state(league_id)
+def build_prediction(
+    league_id: str,
+    home: str,
+    away: str,
+    fixture_id: str | None = None,
+    kickoff: str | None = None,
+) -> dict:
+    forecast_store.init_store()
+    fixture = find_fixture(league_id, home, away, fixture_id=fixture_id, kickoff=kickoff)
+    if fixture:
+        home = fixture["home"]
+        away = fixture["away"]
+        fixture_id = fixture.get("fixture_id") or fixture_id
+        kickoff = fixture.get("kickoff") or kickoff
+        forecast_kind = (
+            "upcoming_fixture"
+            if fixture.get("status") in {"scheduled", "live"}
+            else "completed_fixture"
+        )
+    elif fixture_id and kickoff:
+        # Client supplied a dated fixture identity even if live fixture lookup failed.
+        try:
+            kick_dt = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
+            if kick_dt.tzinfo is None:
+                kick_dt = kick_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if kick_dt > now:
+                forecast_kind = "upcoming_fixture"
+            else:
+                forecast_kind = "completed_fixture"
+        except ValueError:
+            forecast_kind = "upcoming_fixture"
+    else:
+        forecast_kind = "hypothetical_matchup"
+
+    cutoff = training_cutoff(kickoff)
+    state = get_league_state(league_id, cutoff=cutoff)
     teams = state["teams"]
     if home not in teams or away not in teams:
-        raise ValueError("Use team names exactly as listed for this league.")
+        raise ValueError(
+            "Use team names from the selected season catalog. "
+            f"{home!r} / {away!r} not both in {state['league']['season_label']}."
+        )
     if home == away:
         raise ValueError("Choose two different teams.")
 
-    prediction = state["model"].predict(home, away)
+    prediction = state["model"].predict(home, away, max_goals=MODEL_MAX_GOALS, normalize=True)
     ranked = top_scores(prediction)
-    combos = combo_markets(prediction, home, away)[:2]
-    two_leg = best_two_leg(prediction, home, away)
-    medium, high = multi_leg_picks(prediction, home, away)
-    singles = rank_single_picks(prediction, home, away)
+    combo_bundle = best_combos(prediction, home, away)
+    singles = rank_single_selections(prediction, home, away, limit=3)
     result_side, result_label, result_prob = predicted_1x2(prediction, home, away)
-    matches = state["matches"]
+    matches = state["trainable"]
     h2h = matches[
         ((matches["home"] == home) & (matches["away"] == away))
         | ((matches["home"] == away) & (matches["away"] == home))
     ].sort_values("date")
     now = datetime.now(timezone.utc)
 
+    home_form = form_analysis.team_recent_form(matches, home, cutoff)
+    away_form = form_analysis.team_recent_form(matches, away, cutoff)
+    home_venue = form_analysis.venue_career_stats(matches, home, "home", cutoff)
+    away_venue = form_analysis.venue_career_stats(matches, away, "away", cutoff)
+
+    lineup = {
+        "status": "Unavailable",
+        "source": None,
+        "retrieved_at": None,
+        "included_in_model": False,
+        "note": (
+            "Confirmed/expected lineups, injuries and suspensions are not fetched from a "
+            "validated free source in this build. Lineup context is displayed as unavailable "
+            "and is not included numerically in the Dixon–Coles forecast."
+        ),
+    }
+
+    freshness = {
+        "forecast_generated_at": now.isoformat(),
+        "results_current_through": state["results_through"],
+        "training_cutoff": state["cutoff"],
+        "data_version": state["data_version"],
+        "from_cache": bool(state.get("from_cache")),
+        "stale": False,
+        "sources": [
+            {
+                "name": "football-data.co.uk / FotMob results",
+                "role": "match results for Dixon–Coles fit",
+                "ttl_seconds": CSV_TTL,
+            },
+            {
+                "name": "FotMob fixtures",
+                "role": "kickoff, status, fixture identity",
+                "ttl_seconds": FOTMOB_LIVE_TTL,
+            },
+            {
+                "name": "FotMob player stats",
+                "role": "anytime scorer/assist display only",
+                "ttl_seconds": PLAYER_TTL,
+            },
+        ],
+        "lineup_status": lineup["status"],
+        "lineup_retrieved_at": None,
+    }
+
+    limitations = [
+        "Regulation time only (plus stoppage). Extra time and penalties are excluded.",
+        "Player anytime probabilities use season FotMob xG/xA shares × team λ; they do not alter the match score grid.",
+        "No bookmaker odds feed: fair odds are shown; value is unavailable.",
+        TRACKING_NOTE,
+        lineup["note"],
+        home_form.get("note"),
+    ]
+
     result = {
+        "fixture_id": fixture_id,
+        "forecast_kind": forecast_kind,
         "league_id": league_id,
         "league": state["league"]["name"],
         "season": state["league"]["season_label"],
         "home": home,
         "away": away,
-        "home_logo": lookup_crest(league_id, home),
-        "away_logo": lookup_crest(league_id, away),
+        "kickoff": kickoff,
+        "venue": (fixture or {}).get("venue"),
+        "fixture_status": (fixture or {}).get("status"),
+        "home_logo": lookup_crest(league_id, home) or (fixture or {}).get("home_logo"),
+        "away_logo": lookup_crest(league_id, away) or (fixture or {}).get("away_logo"),
         "trained_on": state["trained_on"],
         "current_matches": state["current_matches"],
         "prior_matches": state["prior_matches"],
         "as_of": now.isoformat(),
+        "freshness": freshness,
+        "lineup": lineup,
         "xg_home": float(prediction.home_goal_expectation),
         "xg_away": float(prediction.away_goal_expectation),
+        "xg_definition": (
+            "Dixon–Coles team expected goals (λ), not observed shot-based xG."
+        ),
         "home_win": float(prediction.home_win),
         "draw": float(prediction.draw),
         "away_win": float(prediction.away_win),
@@ -1330,13 +1736,44 @@ def build_prediction(league_id: str, home: str, away: str) -> dict:
         "exact_scores": [
             {"home": h, "away": a, "prob": p} for p, h, a in ranked[:5]
         ],
+        "views": {
+            "most_likely": {
+                "objective": "Rank supported selections by model event probability.",
+                "single_picks": singles,
+                "combo_2leg": combo_bundle["combo_2leg"],
+                "combo_3leg": combo_bundle["combo_3leg"],
+                "combo_note": combo_bundle["combo_note"],
+            },
+            "best_value": {
+                "objective": (
+                    "Expected return using offered decimal odds. "
+                    "Distinct from most-likely probability ranking."
+                ),
+                "status": "unavailable",
+                "reason": "No bookmaker/provider odds feed with timestamp is configured.",
+                "single_picks": [
+                    {
+                        **pick,
+                        "fair_odds": pick.get("fair_odds"),
+                        "market_odds": None,
+                        "expected_value": None,
+                        "value_status": "unavailable",
+                    }
+                    for pick in singles
+                ],
+            },
+        },
         "single_picks": singles,
-        "combos": [{"label": label, "prob": prob} for label, prob in combos],
-        "combo_2leg": two_leg,
-        "medium_risk": medium,
-        "high_risk": high,
-        "home_form": venue_stats(matches, home, "home"),
-        "away_form": venue_stats(matches, away, "away"),
+        "combos": [],
+        "combo_2leg": combo_bundle["combo_2leg"],
+        "combo_3leg": combo_bundle["combo_3leg"],
+        "medium_risk": combo_bundle["combo_3leg"],
+        "high_risk": None,
+        "combo_note": combo_bundle["combo_note"],
+        "grid_diagnostics": combo_bundle["diagnostics"],
+        "recent_form": {"home": home_form, "away": away_form},
+        "home_form": home_venue,
+        "away_form": away_venue,
         "h2h": [
             {
                 "date": row.date.date().isoformat(),
@@ -1347,17 +1784,63 @@ def build_prediction(league_id: str, home: str, away: str) -> dict:
             }
             for row in h2h.itertuples()
         ],
+        "h2h_note": (
+            "Head-to-head is secondary context and is not a separate model weight."
+        ),
         "players": None,
         "player_note": None,
         "player_source": None,
-        "model": "Dixon–Coles",
+        "limitations": [item for item in limitations if item],
+        "tracking_activated_at": forecast_store.tracking_activated_at().isoformat(),
+        "settlement": None,
+        **dixon_coles_meta(state["model"]),
         "inputs": [
-            "Recent match results",
-            "Home/away strength",
-            "Goals for/against",
-            "FotMob player xG/xA",
+            "penaltyblog DixonColesGoalModel",
+            f"time-decay ξ={DEFAULT_XI}",
+            "matches strictly before forecast cutoff",
+            "football-data.co.uk / FotMob finished results",
+        ],
+        "inputs_not_in_model": [
+            "recent-form summary cards",
+            "head-to-head list",
+            "lineups / injuries / suspensions",
+            "bookmaker odds",
         ],
     }
+
+    # Snapshot / settlement for dated fixtures only
+    if fixture_id and kickoff and forecast_kind == "upcoming_fixture":
+        save_info = forecast_store.save_live_forecast(fixture_id, result)
+        result["forecast_saved"] = save_info
+    elif fixture_id and kickoff:
+        forecast_store.freeze_at_kickoff(fixture_id, kickoff)
+        if fixture and fixture.get("finished") and fixture.get("score"):
+            score = parse_score(fixture.get("score"))
+            if score:
+                settlement = forecast_store.settle_fixture(
+                    fixture_id,
+                    score[0],
+                    score[1],
+                    finished=True,
+                    cancelled=bool(fixture.get("cancelled")),
+                    postponed=bool(fixture.get("postponed")),
+                )
+                result["settlement"] = settlement
+        frozen = forecast_store.get_frozen(fixture_id)
+        if frozen and frozen.get("settlement"):
+            result["settlement"] = frozen["settlement"]
+        elif frozen:
+            result["frozen_pre_kickoff"] = {
+                "frozen_at": frozen.get("frozen_at"),
+                "predicted_result_label": frozen.get("predicted_result_label"),
+                "exact_scores": frozen.get("exact_scores"),
+            }
+
+    if forecast_kind == "hypothetical_matchup":
+        result["forecast_kind_note"] = (
+            "No scheduled meeting found for this pair in the loaded fixture list. "
+            "Labeled as a hypothetical matchup."
+        )
 
     _players_for_state(state)
     if state["player_error"]:

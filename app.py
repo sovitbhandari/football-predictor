@@ -53,16 +53,34 @@ def teams(league_id: str, tz: str | None = None):
         raise HTTPException(status_code=404, detail="Unknown league") from None
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not load league data ({error}). Try again in a minute.",
+        ) from error
     league = state["league"]
-    fixtures = get_fixtures(league_id, tz)
+    try:
+        fixtures = get_fixtures(league_id, tz)
+    except Exception as error:
+        fixtures = {
+            "as_of": None,
+            "timezone": tz,
+            "live": [],
+            "today": [],
+            "next": None,
+            "next_matches": [],
+            "upcoming": [],
+            "carousel": [],
+            "error": str(error),
+        }
     focus = (
         fixtures["live"][0]
-        if fixtures["live"]
+        if fixtures.get("live")
         else fixtures["today"][0]
-        if fixtures["today"]
+        if fixtures.get("today")
         else fixtures["next_matches"][0]
-        if fixtures["next_matches"]
-        else fixtures["next"]
+        if fixtures.get("next_matches")
+        else fixtures.get("next")
     )
     return {
         "id": league["id"],
@@ -74,15 +92,16 @@ def teams(league_id: str, tz: str | None = None):
         "prior_matches": state["prior_matches"],
         "results_through": state.get("results_through"),
         "tracking_activated_at": forecast_store.tracking_activated_at().isoformat(),
-        "as_of": fixtures["as_of"],
-        "timezone": fixtures["timezone"],
-        "live": fixtures["live"],
-        "today": fixtures["today"],
-        "next": fixtures["next"],
-        "next_matches": fixtures["next_matches"],
-        "upcoming": fixtures["upcoming"],
+        "as_of": fixtures.get("as_of"),
+        "timezone": fixtures.get("timezone"),
+        "live": fixtures.get("live") or [],
+        "today": fixtures.get("today") or [],
+        "next": fixtures.get("next"),
+        "next_matches": fixtures.get("next_matches") or [],
+        "upcoming": fixtures.get("upcoming") or [],
         "carousel": fixtures.get("carousel") or [],
         "focus": focus,
+        "fixtures_error": fixtures.get("error"),
     }
 
 

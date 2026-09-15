@@ -282,11 +282,17 @@ def fetch_bytes(url: str, ttl: int = CSV_TTL, params: dict | None = None) -> byt
     if path.exists() and time.time() - path.stat().st_mtime < ttl:
         data = path.read_bytes()
         return _mem_set(key, data, ttl)
-    response = _SESSION.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.content
-    path.write_bytes(data)
-    return _mem_set(key, data, ttl)
+    try:
+        response = _SESSION.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        data = response.content
+        path.write_bytes(data)
+        return _mem_set(key, data, ttl)
+    except Exception:
+        if path.exists():
+            data = path.read_bytes()
+            return _mem_set(key, data, min(ttl, 300))
+        raise
 
 
 def fetch_json(url: str, ttl: int = FOTMOB_LIVE_TTL, params: dict | None = None) -> dict:
@@ -1465,6 +1471,7 @@ def get_league_state(
     cutoff: datetime | None = None,
     xi: float = DEFAULT_XI,
 ) -> dict:
+    league_by_id(league_id)  # raise KeyError for unknown ids before locking
     cut = cutoff or datetime.now(timezone.utc)
     # Bucket cutoffs to the hour so we do not refit on every click.
     cut_key = cut.astimezone(timezone.utc).strftime("%Y%m%d%H")
@@ -1486,10 +1493,15 @@ def get_league_state(
     if not owner:
         event.wait(timeout=180)
         with _LOCK:
-            cached = _CACHE[cache_key]
-            cached = dict(cached)
-            cached["from_cache"] = True
-            return cached
+            cached = _CACHE.get(cache_key)
+            if cached is not None:
+                cached = dict(cached)
+                cached["from_cache"] = True
+                return cached
+            _FIT_EVENTS.pop(cache_key, None)
+        raise ValueError(
+            f"Could not finish loading {league_id}. The model fit failed or timed out — try again."
+        )
     try:
         state = fit_league(league_by_id(league_id), cutoff=cut, xi=xi)
         state["from_cache"] = False
@@ -1501,8 +1513,16 @@ def get_league_state(
                 _FIT_EVENTS.pop(old_id, None)
         threading.Thread(target=_warmup_players, args=(league_id,), daemon=True).start()
         return state
+    except Exception:
+        with _LOCK:
+            _FIT_EVENTS.pop(cache_key, None)
+        raise
     finally:
         event.set()
+        with _LOCK:
+            # Drop the latch once the fit attempt finished (success is in _CACHE).
+            if cache_key not in _CACHE:
+                _FIT_EVENTS.pop(cache_key, None)
 
 
 def get_fixtures(league_id: str, tz_name: str | None = None) -> dict:

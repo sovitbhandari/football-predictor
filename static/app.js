@@ -584,7 +584,7 @@ async function runPredict(match) {
       body: JSON.stringify(predictBody(selected)),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Prediction failed");
+    if (!response.ok) throw new Error(formatApiError(data.detail) || "Prediction failed");
     cache.set(key, data);
     if (token !== predictToken) return;
     render(data, selected);
@@ -599,7 +599,14 @@ async function runPredict(match) {
   }
 }
 
-async function loadTeams() {
+function formatApiError(detail) {
+  if (detail == null) return "Request failed";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
+  }
+  return String(detail);
+}
   const token = ++teamsToken;
   status.textContent = "Loading fixtures…";
   home.disabled = away.disabled = true;
@@ -611,7 +618,7 @@ async function loadTeams() {
   const query = new URLSearchParams({ tz: localTz });
   const data = await fetch(`/api/leagues/${league.value}/teams?${query}`).then(async (r) => {
     const body = await r.json();
-    if (!r.ok) throw new Error(body.detail || "Could not load teams");
+    if (!r.ok) throw new Error(formatApiError(body.detail) || "Could not load teams");
     return body;
   });
   if (token !== teamsToken) return;

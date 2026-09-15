@@ -41,6 +41,23 @@ CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 CSV_TTL = 6 * 3600
 FOTMOB_LIVE_TTL = 45
 FOTMOB_SEASON_TTL = 6 * 3600
+# Regulation + ET buffer; anything older without a finished flag is not "live".
+MAX_MATCH_LIVE_SECONDS = int(3.5 * 3600)
+STARTING_SOON_LIVE_SECONDS = 15 * 60
+FINISHED_REASON_SHORT = {
+    "ft",
+    "aet",
+    "pen",
+    "pens",
+    "after pens",
+    "aw",
+    "awarded",
+    "ab",
+    "abd",
+    "can",
+    "post",
+    "pp",
+}
 PLAYER_TTL = 3 * 3600
 
 _SESSION = requests.Session()
@@ -463,8 +480,14 @@ def load_extra(league: dict) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def fotmob_league_payload(league_id: int, season: str | None = None) -> dict:
-    ttl = FOTMOB_SEASON_TTL if season else FOTMOB_LIVE_TTL
+def fotmob_league_payload(
+    league_id: int,
+    season: str | None = None,
+    *,
+    live: bool = False,
+) -> dict:
+    # Fixture/live boards must not reuse the multi-hour historical season cache.
+    ttl = FOTMOB_LIVE_TTL if live or season is None else FOTMOB_SEASON_TTL
     params = {"season": season} if season else None
     return fetch_json(
         FOTMOB_LEAGUE.format(league_id=league_id),
@@ -757,6 +780,8 @@ def fixture_dict(
 ) -> dict:
     status = match.get("status") or {}
     reason = status.get("reason") or {}
+    reason_short = str(reason.get("short") or "").strip().lower()
+    reason_long = str(reason.get("long") or "").strip().lower()
     kickoff = fotmob_kickoff(match)
     home = match["home"]["name"]
     away = match["away"]["name"]
@@ -764,15 +789,30 @@ def fixture_dict(
     mapped_away = map_to_catalog(away, catalog) if catalog else away
     finished = bool(status.get("finished"))
     cancelled = bool(status.get("cancelled"))
+    if reason_short in FINISHED_REASON_SHORT or "full time" in reason_long:
+        finished = True
+    if reason_short in {"can", "post", "pp"}:
+        cancelled = cancelled or reason_short == "can"
     live_time = status.get("liveTime") or {}
     minute = None
     if isinstance(live_time, dict):
         minute = live_time.get("short") or live_time.get("long")
     live = False
     if not cancelled and not finished:
-        live = bool(status.get("started") or minute)
-        if not live and now is not None and kickoff is not None and kickoff <= now:
+        started = bool(status.get("started") or minute)
+        if started:
             live = True
+            if now is not None and kickoff is not None:
+                age = (now - kickoff).total_seconds()
+                # Stale FotMob snapshots can leave started=true after full time.
+                if age > MAX_MATCH_LIVE_SECONDS:
+                    finished = True
+                    live = False
+        elif now is not None and kickoff is not None:
+            age = (now - kickoff).total_seconds()
+            # Only treat kickoff-passed-with-no-feed as live in a short window.
+            if -STARTING_SOON_LIVE_SECONDS <= age <= MAX_MATCH_LIVE_SECONDS:
+                live = age >= 0
     home_name = mapped_home or home
     away_name = mapped_away or away
     home_logo = remember_crest(league_id, home_name, match["home"].get("id"))
@@ -783,7 +823,9 @@ def fixture_dict(
         if league_id and match_id is not None
         else None
     )
-    postponed = bool(status.get("awarded") is False and reason.get("short") in {"Post", "PP"})
+    postponed = bool(
+        status.get("awarded") is False and reason_short in {"post", "pp"}
+    )
     return {
         "fixture_id": fixture_id,
         "match_id": match_id,
@@ -816,11 +858,11 @@ def league_fixtures(
     league: dict, catalog: list[str] | None = None, tz_name: str | None = None
 ) -> dict:
     season = fotmob_fixture_season(league)
-    payload = fotmob_league_payload(league["fotmob_id"], season)
+    payload = fotmob_league_payload(league["fotmob_id"], season, live=True)
     matches = (payload.get("fixtures") or {}).get("allMatches") or []
     # Some cups publish the upcoming slate on the default season feed first.
     if not matches and season:
-        payload = fotmob_league_payload(league["fotmob_id"], None)
+        payload = fotmob_league_payload(league["fotmob_id"], None, live=True)
         matches = (payload.get("fixtures") or {}).get("allMatches") or []
     tz = resolve_tz(tz_name)
     now = datetime.now(timezone.utc)
@@ -888,10 +930,8 @@ def league_fixtures(
 
 def live_matches_for_league(league: dict, now: datetime | None = None) -> list[dict]:
     now = now or datetime.now(timezone.utc)
-    payload = fotmob_league_payload(
-        league["fotmob_id"],
-        league.get("season") if league["kind"] == "fotmob" else None,
-    )
+    season = fotmob_fixture_season(league)
+    payload = fotmob_league_payload(league["fotmob_id"], season, live=True)
     live = []
     for match in (payload.get("fixtures") or {}).get("allMatches") or []:
         status = match.get("status") or {}

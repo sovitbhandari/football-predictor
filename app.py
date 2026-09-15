@@ -6,7 +6,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import forecasts as forecast_store
-from engine import LEAGUES, build_prediction, get_fixtures, get_league_state, get_live_board
+from engine import (
+    LEAGUES,
+    build_prediction,
+    get_fixtures,
+    get_league_catalog,
+    get_live_board,
+    league_by_id,
+)
 
 ROOT = Path(__file__).resolve().parent
 app = FastAPI(title="Football Predictor")
@@ -48,9 +55,13 @@ def leagues():
 @app.get("/api/leagues/{league_id}/teams")
 def teams(league_id: str, tz: str | None = None):
     try:
-        state = get_league_state(league_id)
+        league_by_id(league_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Unknown league") from None
+    try:
+        # Catalog + fixtures only — do not fit Dixon–Coles just to browse.
+        state = get_league_catalog(league_id)
+        fixtures = get_fixtures(league_id, tz)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as error:
@@ -59,20 +70,6 @@ def teams(league_id: str, tz: str | None = None):
             detail=f"Could not load league data ({error}). Try again in a minute.",
         ) from error
     league = state["league"]
-    try:
-        fixtures = get_fixtures(league_id, tz)
-    except Exception as error:
-        fixtures = {
-            "as_of": None,
-            "timezone": tz,
-            "live": [],
-            "today": [],
-            "next": None,
-            "next_matches": [],
-            "upcoming": [],
-            "carousel": [],
-            "error": str(error),
-        }
     focus = (
         fixtures["live"][0]
         if fixtures.get("live")
@@ -101,12 +98,17 @@ def teams(league_id: str, tz: str | None = None):
         "upcoming": fixtures.get("upcoming") or [],
         "carousel": fixtures.get("carousel") or [],
         "focus": focus,
-        "fixtures_error": fixtures.get("error"),
+        "model_ready": False,
+        "note": "Model fits on demand when you open a match prediction.",
     }
 
 
 @app.post("/api/predict")
 def predict(payload: PredictRequest):
+    try:
+        league_by_id(payload.league_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown league") from None
     try:
         return build_prediction(
             payload.league_id,
@@ -115,10 +117,13 @@ def predict(payload: PredictRequest):
             fixture_id=payload.fixture_id,
             kickoff=payload.kickoff,
         )
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Unknown league") from None
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not score match ({error}). Try again in a minute.",
+        ) from error
 
 
 @app.get("/api/forecasts/tracked")

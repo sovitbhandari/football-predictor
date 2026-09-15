@@ -236,13 +236,15 @@ TEAM_HINTS = {
 }
 
 _CACHE: OrderedDict[str, dict] = OrderedDict()
+_CATALOG: OrderedDict[str, dict] = OrderedDict()
 _CRESTS = {}
 _HTTP_MEM = {}
 _FIXTURE_MEM = {}
 _LIVE_BOARD = {"expires": 0.0, "rows": []}
-MAX_LEAGUE_CACHE = 6
+MAX_LEAGUE_CACHE = 2
+MAX_CATALOG_CACHE = 12
 MAX_HTTP_MEM = 24
-MAX_FIXTURE_MEM = 8
+MAX_FIXTURE_MEM = 12
 _LOCK = threading.Lock()
 _FIT_EVENTS = {}
 _PLAYER_LOCKS = {}
@@ -322,9 +324,15 @@ def normalize_matches(frame: pd.DataFrame, season: str) -> pd.DataFrame:
         "HG": "goals_home",
         "AG": "goals_away",
     }
-    matches = frame.rename(columns=rename)[
-        ["Date", "home", "away", "goals_home", "goals_away"]
-    ].copy()
+    matches = frame.rename(columns=rename)
+    needed = ["Date", "home", "away", "goals_home", "goals_away"]
+    missing = [col for col in needed if col not in matches.columns]
+    if missing:
+        raise ValueError(
+            f"Results file for season {season} is missing columns {missing}. "
+            "The download may be incomplete or temporarily unavailable."
+        )
+    matches = matches[needed].copy()
     matches["date"] = pd.to_datetime(matches["Date"], dayfirst=True, errors="coerce")
     matches["season"] = season
     matches = matches.dropna(subset=["date", "home", "away", "goals_home", "goals_away"])
@@ -1466,6 +1474,58 @@ def fit_league(
     }
 
 
+def get_league_catalog(league_id: str) -> dict:
+    """Load teams/results metadata without fitting Dixon–Coles.
+
+    Browsing fixtures must not require a full model fit (too heavy for free RAM).
+    """
+    league = league_by_id(league_id)
+    with _LOCK:
+        cached = _CATALOG.get(league_id)
+        if cached is not None:
+            _CATALOG.move_to_end(league_id)
+            return cached
+    matches = load_league(league)
+    if matches.empty:
+        raise ValueError(f"No completed matches found for {league['name']}.")
+    current = matches[matches["season"] == league["season"]]
+    if current.empty:
+        raise ValueError(
+            f"No {league['season_label']} matches found for {league['name']} yet."
+        )
+    teams = sorted(set(current["home"]) | set(current["away"]))
+    latest = pd.to_datetime(matches["date"], utc=True).max()
+    catalog = {
+        "league": league,
+        "teams": teams,
+        "trained_on": len(matches),
+        "current_matches": len(current),
+        "prior_matches": len(matches) - len(current),
+        "results_through": latest.date().isoformat(),
+    }
+    with _LOCK:
+        _CATALOG[league_id] = catalog
+        _CATALOG.move_to_end(league_id)
+        while len(_CATALOG) > MAX_CATALOG_CACHE:
+            _CATALOG.popitem(last=False)
+    return catalog
+
+
+def get_fixtures(league_id: str, tz_name: str | None = None) -> dict:
+    key = f"{league_id}|{tz_name or ''}"
+    packed = _FIXTURE_MEM.get(key)
+    if packed and packed[0] > time.time():
+        return packed[1]
+    catalog_state = get_league_catalog(league_id)
+    league = catalog_state["league"]
+    catalog = None if league["kind"] == "fotmob" else catalog_state["teams"]
+    data = league_fixtures(league, catalog, tz_name)
+    _FIXTURE_MEM[key] = (time.time() + FOTMOB_LIVE_TTL, data)
+    while len(_FIXTURE_MEM) > MAX_FIXTURE_MEM:
+        _FIXTURE_MEM.pop(next(iter(_FIXTURE_MEM)))
+    return data
+
+
 def get_league_state(
     league_id: str,
     cutoff: datetime | None = None,
@@ -1523,20 +1583,6 @@ def get_league_state(
             # Drop the latch once the fit attempt finished (success is in _CACHE).
             if cache_key not in _CACHE:
                 _FIT_EVENTS.pop(cache_key, None)
-
-
-def get_fixtures(league_id: str, tz_name: str | None = None) -> dict:
-    key = f"{league_id}|{tz_name or ''}"
-    packed = _FIXTURE_MEM.get(key)
-    if packed and packed[0] > time.time():
-        return packed[1]
-    state = get_league_state(league_id)
-    catalog = None if state["league"]["kind"] == "fotmob" else state["teams"]
-    data = league_fixtures(state["league"], catalog, tz_name)
-    _FIXTURE_MEM[key] = (time.time() + FOTMOB_LIVE_TTL, data)
-    while len(_FIXTURE_MEM) > MAX_FIXTURE_MEM:
-        _FIXTURE_MEM.pop(next(iter(_FIXTURE_MEM)))
-    return data
 
 
 def find_fixture(

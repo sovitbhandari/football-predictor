@@ -615,32 +615,43 @@ async function loadTeams() {
   results.classList.add("hidden");
   cache.clear();
   paintedLeague = "";
+  carousel = [];
+  selectedKey = "";
+  $("fixtures").innerHTML = "";
+  $("as-of").textContent = "";
   predictToken += 1;
   predictAbort?.abort();
   const query = new URLSearchParams({ tz: localTz });
-  const data = await fetch(`/api/leagues/${league.value}/teams?${query}`).then(async (r) => {
-    const body = await r.json();
-    if (!r.ok) throw new Error(formatApiError(body.detail) || "Could not load teams");
-    return body;
-  });
-  if (token !== teamsToken) return;
-  leagueMeta = data;
-  carousel = data.carousel && data.carousel.length
-    ? data.carousel
-    : [...(data.live || []), ...(data.today || []), ...(data.next_matches || []), ...(data.upcoming || [])];
-  const wantedHome = params().get("home");
-  const wantedAway = params().get("away");
-  const focus = findInCarousel(wantedHome, wantedAway)
-    || data.focus
-    || carousel[0];
-  const homePick = catalogNameFrom(data.teams, focus?.home, focus?.home_source, wantedHome) || data.teams[0];
-  const awayPick = catalogNameFrom(data.teams, focus?.away, focus?.away_source, wantedAway) || data.teams[1] || data.teams[0];
-  setOptions(home, data.teams, homePick);
-  setOptions(away, data.teams, awayPick);
-  home.disabled = away.disabled = false;
-  status.textContent = `${data.name} ${data.season}: trained on ${data.trained_on} matches (${data.current_matches} this season).`;
-  paintCarousel();
-  if (focus) await selectFixture(focus, true, false);
+  try {
+    const data = await fetch(`/api/leagues/${league.value}/teams?${query}`).then(async (r) => {
+      const body = await r.json();
+      if (!r.ok) throw new Error(formatApiError(body.detail) || "Could not load teams");
+      return body;
+    });
+    if (token !== teamsToken) return;
+    leagueMeta = data;
+    carousel = data.carousel && data.carousel.length
+      ? data.carousel
+      : [...(data.live || []), ...(data.today || []), ...(data.next_matches || []), ...(data.upcoming || [])];
+    const wantedHome = params().get("home");
+    const wantedAway = params().get("away");
+    const focus = findInCarousel(wantedHome, wantedAway)
+      || data.focus
+      || carousel[0];
+    const homePick = catalogNameFrom(data.teams, focus?.home, focus?.home_source, wantedHome) || data.teams[0];
+    const awayPick = catalogNameFrom(data.teams, focus?.away, focus?.away_source, wantedAway) || data.teams[1] || data.teams[0];
+    setOptions(home, data.teams, homePick);
+    setOptions(away, data.teams, awayPick);
+    home.disabled = away.disabled = false;
+    status.textContent = `${data.name} ${data.season}: ${data.current_matches} matches this season · model fits when you predict.`;
+    paintCarousel();
+    if (focus) await selectFixture(focus, true, false);
+  } catch (error) {
+    if (token !== teamsToken) return;
+    home.disabled = away.disabled = false;
+    status.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+    $("fixtures").innerHTML = `<p class="explain">Could not load fixtures for this league.</p>`;
+  }
 }
 
 $("fixtures").addEventListener("click", (event) => {

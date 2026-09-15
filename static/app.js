@@ -79,8 +79,8 @@ function fixtureKey(match) {
 function sameTeams(match, homeName, awayName) {
   if (!match || !homeName || !awayName) return false;
   return (
-    (match.home === homeName && match.away === awayName)
-    || (match.home_source === homeName && match.away_source === awayName)
+    (teamsEqual(match.home, homeName) && teamsEqual(match.away, awayName))
+    || (teamsEqual(match.home_source, homeName) && teamsEqual(match.away_source, awayName))
   );
 }
 
@@ -156,10 +156,12 @@ function LiveBoard(matches) {
 
 function MatchHeader(data, match) {
   const kick = match?.kickoff ? when(match.kickoff) : "";
+  const homeName = headerName("home", data, match);
+  const awayName = headerName("away", data, match);
   return `<div class="match-header">
     <div class="team-block home">
-      ${crest(data.home_logo || match?.home_logo, data.home, "lg")}
-      <h2 class="team-name">${escapeHtml(data.home)}</h2>
+      ${crest(data.home_logo || match?.home_logo, homeName, "lg")}
+      <h2 class="team-name">${escapeHtml(homeName)}</h2>
     </div>
     <div class="vs-col">
       <div class="vs">VS</div>
@@ -168,8 +170,8 @@ function MatchHeader(data, match) {
       <div class="ai-chip">AI model prediction</div>
     </div>
     <div class="team-block away">
-      ${crest(data.away_logo || match?.away_logo, data.away, "lg")}
-      <h2 class="team-name">${escapeHtml(data.away)}</h2>
+      ${crest(data.away_logo || match?.away_logo, awayName, "lg")}
+      <h2 class="team-name">${escapeHtml(awayName)}</h2>
     </div>
   </div>`;
 }
@@ -372,33 +374,68 @@ function findInCarousel(homeName, awayName) {
   return carousel.find((item) => sameTeams(item, homeName, awayName));
 }
 
-function pickTeam(select, name) {
-  if (!name) return false;
-  const values = [...select.options].map((opt) => opt.value);
-  if (values.includes(name)) {
-    select.value = name;
-    return true;
-  }
-  const folded = name.toLowerCase();
-  const hit = values.find((value) => {
-    const other = value.toLowerCase();
-    return folded.includes(other) || other.includes(folded);
-  });
-  if (hit) {
-    select.value = hit;
-    return true;
+function foldTeam(name) {
+  return String(name || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/'/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function teamsEqual(a, b) {
+  const fa = foldTeam(a);
+  const fb = foldTeam(b);
+  if (!fa || !fb) return false;
+  if (fa === fb) return true;
+  if (fa.replaceAll("y", "") === fb.replaceAll("y", "")) return true;
+  const ta = fa.split(" ").filter(Boolean);
+  const tb = fb.split(" ").filter(Boolean);
+  const subset = (small, big) => small.every((token) => big.includes(token));
+  if (subset(ta, tb) || subset(tb, ta)) {
+    const smaller = ta.join(" ").length <= tb.join(" ").length ? ta : tb;
+    return smaller.join("").length >= 4;
   }
   return false;
+}
+
+function catalogNameFrom(values, ...names) {
+  for (const name of names) {
+    if (!name) continue;
+    const hits = values.filter((value) => teamsEqual(value, name));
+    if (hits.length === 1) return hits[0];
+  }
+  return null;
+}
+
+function catalogName(...names) {
+  return catalogNameFrom([...home.options].map((opt) => opt.value), ...names);
+}
+
+function headerName(side, data, match) {
+  if (
+    match
+    && (teamsEqual(match[side], data[side]) || teamsEqual(match[`${side}_source`], data[side]))
+  ) {
+    return match[`${side}_short`] || data[side];
+  }
+  return data[side];
 }
 
 async function selectFixture(match, predictNow, fromUser) {
   if (!match) return;
   selectedKey = fixtureKey(match);
-  pickTeam(home, match.home) || pickTeam(home, match.home_source);
-  pickTeam(away, match.away) || pickTeam(away, match.away_source);
-  if (!home.value || !away.value || home.value === away.value) return;
-  writeParams({ league: league.value, home: home.value, away: away.value });
+  const homeName = catalogName(match.home, match.home_source);
+  const awayName = catalogName(match.away, match.away_source);
   highlightCarousel();
+  if (!homeName || !awayName || homeName === awayName) {
+    status.innerHTML = `<span class="error">Could not map this fixture onto the model teams.</span>`;
+    return;
+  }
+  home.value = homeName;
+  away.value = awayName;
+  writeParams({ league: league.value, home: homeName, away: awayName });
   if (predictNow) {
     if (fromUser) results.scrollIntoView({ behavior: "smooth", block: "start" });
     await runPredict(match);
@@ -486,8 +523,10 @@ async function loadTeams() {
   const focus = findInCarousel(wantedHome, wantedAway)
     || data.focus
     || carousel[0];
-  setOptions(home, data.teams, (focus && focus.home) || wantedHome || data.teams[0]);
-  setOptions(away, data.teams, (focus && focus.away) || wantedAway || data.teams[1] || data.teams[0]);
+  const homePick = catalogNameFrom(data.teams, focus?.home, focus?.home_source, wantedHome) || data.teams[0];
+  const awayPick = catalogNameFrom(data.teams, focus?.away, focus?.away_source, wantedAway) || data.teams[1] || data.teams[0];
+  setOptions(home, data.teams, homePick);
+  setOptions(away, data.teams, awayPick);
   home.disabled = away.disabled = false;
   status.textContent = `${data.name} ${data.season}: trained on ${data.trained_on} matches (${data.current_matches} this season).`;
   paintCarousel();

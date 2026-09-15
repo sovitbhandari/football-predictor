@@ -219,6 +219,8 @@ TEAM_HINTS = {
     "sporting lisbon": "sp lisbon",
     "estrela da amadora": "estrela",
     "cf estrela": "estrela",
+    "espanyol": "espanol",
+    "rcd espanyol": "espanol",
 }
 
 _CACHE: OrderedDict[str, dict] = OrderedDict()
@@ -403,19 +405,28 @@ def load_fotmob_results(league: dict) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def fold_keys(name: str) -> set[str]:
+    base = fold_name(name)
+    keys = {base, base.replace("y", "")}
+    hinted = TEAM_HINTS.get(base)
+    if hinted:
+        keys.add(hinted)
+        keys.add(hinted.replace("y", ""))
+    return {key for key in keys if key}
+
+
 def map_to_catalog(name: str, catalog: list[str]) -> str | None:
-    folded = fold_name(name)
-    hinted = TEAM_HINTS.get(folded, folded)
-    exact = [item for item in catalog if fold_name(item) in {folded, hinted}]
+    keys = fold_keys(name)
+    exact = [item for item in catalog if fold_keys(item) & keys]
     if len(exact) == 1:
         return exact[0]
-    via_hint = match_team(hinted, catalog)
+    via_hint = match_team(TEAM_HINTS.get(fold_name(name), fold_name(name)), catalog)
     if via_hint:
         return via_hint
     via_name = match_team(name, catalog)
     if via_name:
         return via_name
-    query_tokens = set(folded.split())
+    query_tokens = set(fold_name(name).split())
     nested = [
         item
         for item in catalog

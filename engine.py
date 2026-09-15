@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import requests
 from penaltyblog.models import DixonColesGoalModel, dixon_coles_weights
+from penaltyblog.models.dixon_coles import compute_dixon_coles_probabilities
+from penaltyblog.models.football_probability_grid import FootballProbabilityGrid
 
 import forecasts as forecast_store
 import form as form_analysis
@@ -58,6 +60,39 @@ LEAGUES = [
         "fotmob_id": 47,
     },
     {
+        "id": "championship",
+        "name": "EFL Championship",
+        "country": "England",
+        "kind": "european",
+        "code": "E1",
+        "season": "2627",
+        "prior_season": "2526",
+        "season_label": "2026/27",
+        "fotmob_id": 48,
+    },
+    {
+        "id": "efl-cup",
+        "name": "EFL Cup",
+        "country": "England",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 133,
+        "parent_league_id": "premier-league",
+    },
+    {
+        "id": "fa-cup",
+        "name": "FA Cup",
+        "country": "England",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 132,
+        "parent_league_id": "premier-league",
+    },
+    {
         "id": "ucl",
         "name": "UEFA Champions League",
         "country": "Europe",
@@ -66,6 +101,26 @@ LEAGUES = [
         "prior_season": "2025/2026",
         "season_label": "2026/27",
         "fotmob_id": 42,
+    },
+    {
+        "id": "uel",
+        "name": "UEFA Europa League",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 73,
+    },
+    {
+        "id": "uecl",
+        "name": "UEFA Conference League",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 10216,
     },
     {
         "id": "laliga",
@@ -77,6 +132,28 @@ LEAGUES = [
         "prior_season": "2526",
         "season_label": "2026/27",
         "fotmob_id": 87,
+    },
+    {
+        "id": "copa-del-rey",
+        "name": "Copa del Rey",
+        "country": "Spain",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 138,
+        "parent_league_id": "laliga",
+    },
+    {
+        "id": "spanish-super-cup",
+        "name": "Spanish Super Cup",
+        "country": "Spain",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2025/2026",
+        "season_label": "2026/27",
+        "fotmob_id": 139,
+        "parent_league_id": "laliga",
     },
     {
         "id": "serie-a",
@@ -233,6 +310,29 @@ TEAM_HINTS = {
     "cf estrela": "estrela",
     "espanyol": "espanol",
     "rcd espanyol": "espanol",
+    "sheffield united": "sheffield united",
+    "sheffield wednesday": "sheffield wednesday",
+    "west bromwich albion": "west brom",
+    "west brom": "west brom",
+    "queens park rangers": "qpr",
+    "qpr": "qpr",
+    "birmingham city": "birmingham",
+    "blackburn rovers": "blackburn",
+    "bolton wanderers": "bolton",
+    "charlton athletic": "charlton",
+    "derby county": "derby",
+    "huddersfield town": "huddersfield",
+    "middlesbrough": "middlesbrough",
+    "millwall": "millwall",
+    "norwich city": "norwich",
+    "oxford united": "oxford",
+    "plymouth argyle": "plymouth",
+    "portsmouth": "portsmouth",
+    "preston north end": "preston",
+    "stoke city": "stoke",
+    "swansea city": "swansea",
+    "watford": "watford",
+    "wrexham": "wrexham",
 }
 
 _CACHE: OrderedDict[str, dict] = OrderedDict()
@@ -242,9 +342,9 @@ _HTTP_MEM = {}
 _FIXTURE_MEM = {}
 _LIVE_BOARD = {"expires": 0.0, "rows": []}
 MAX_LEAGUE_CACHE = 2
-MAX_CATALOG_CACHE = 12
+MAX_CATALOG_CACHE = 20
 MAX_HTTP_MEM = 24
-MAX_FIXTURE_MEM = 12
+MAX_FIXTURE_MEM = 16
 _LOCK = threading.Lock()
 _FIT_EVENTS = {}
 _PLAYER_LOCKS = {}
@@ -363,14 +463,6 @@ def load_extra(league: dict) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def load_league(league: dict) -> pd.DataFrame:
-    if league["kind"] == "european":
-        return load_european(league)
-    if league["kind"] == "fotmob":
-        return load_fotmob_results(league)
-    return load_extra(league)
-
-
 def fotmob_league_payload(league_id: int, season: str | None = None) -> dict:
     ttl = FOTMOB_SEASON_TTL if season else FOTMOB_LIVE_TTL
     params = {"season": season} if season else None
@@ -379,6 +471,96 @@ def fotmob_league_payload(league_id: int, season: str | None = None) -> dict:
         ttl=ttl,
         params=params,
     )
+
+
+def resolve_fotmob_seasons(league: dict) -> tuple[str, str]:
+    """Use the newest FotMob seasons that actually have completed matches.
+
+    Domestic cups and early European group phases often publish the next season
+    slug before any results land. Prefer the newest season with finished games
+    so training/catalog do not claim an empty "current" campaign.
+    """
+    payload = fotmob_league_payload(league["fotmob_id"], None)
+    available = list(payload.get("allAvailableSeasons") or [])
+    details = payload.get("details") or {}
+    wanted = league.get("season")
+    prior_wanted = league.get("prior_season")
+
+    def has_finished(season_key: str | None) -> bool:
+        if not season_key:
+            return False
+        data = fotmob_league_payload(league["fotmob_id"], season_key)
+        details_sel = (data.get("details") or {}).get("selectedSeason")
+        # FotMob ignores unpublished season queries and silently returns another year.
+        if details_sel and details_sel != season_key:
+            return False
+        for match in (data.get("fixtures") or {}).get("allMatches") or []:
+            status = match.get("status") or {}
+            if status.get("finished") and not status.get("cancelled"):
+                return True
+        return False
+
+    candidates = []
+    if wanted:
+        candidates.append(wanted)
+    for item in available:
+        if item not in candidates:
+            candidates.append(item)
+    season = None
+    for candidate in candidates:
+        if has_finished(candidate):
+            season = candidate
+            break
+    if season is None:
+        season = (
+            details.get("latestSeason")
+            or details.get("selectedSeason")
+            or (available[0] if available else wanted)
+        )
+    prior = None
+    try:
+        idx = available.index(season)
+        if idx + 1 < len(available):
+            prior = available[idx + 1]
+    except ValueError:
+        prior = None
+    if prior is None:
+        prior = prior_wanted if prior_wanted != season else (available[1] if len(available) > 1 else prior_wanted)
+    return season, prior
+
+
+def format_season_label(season_key: str | None, fallback: str) -> str:
+    if not season_key:
+        return fallback
+    text = str(season_key)
+    if "/" in text:
+        left, right = text.split("/", 1)
+        return f"{left}/{right[-2:]}" if len(right) >= 2 else text
+    return text
+
+
+def effective_season(league: dict) -> tuple[str, str]:
+    """Return (season_key, season_label) for filtering/training."""
+    if league.get("kind") == "fotmob":
+        season_key, _ = resolve_fotmob_seasons(league)
+        return season_key, format_season_label(season_key, league["season_label"])
+    return league["season"], league["season_label"]
+
+
+def fotmob_fixture_season(league: dict) -> str | None:
+    """Season query for upcoming fixtures; None when the configured year is unpublished."""
+    if league.get("kind") != "fotmob":
+        return None
+    payload = fotmob_league_payload(league["fotmob_id"], None)
+    available = payload.get("allAvailableSeasons") or []
+    wanted = league.get("season")
+    if not wanted or wanted not in available:
+        return None
+    check = fotmob_league_payload(league["fotmob_id"], wanted)
+    selected = (check.get("details") or {}).get("selectedSeason")
+    if selected and selected != wanted:
+        return None
+    return wanted
 
 
 def parse_score(score_str: str | None) -> tuple[int, int] | None:
@@ -399,12 +581,24 @@ def fotmob_kickoff(match: dict) -> datetime | None:
 
 
 def load_fotmob_results(league: dict) -> pd.DataFrame:
-    def season_frame(season: str) -> pd.DataFrame:
-        payload = fotmob_league_payload(league["fotmob_id"], season)
+    season, prior_season = resolve_fotmob_seasons(league)
+
+    def season_frame(season_key: str) -> pd.DataFrame:
+        payload = fotmob_league_payload(league["fotmob_id"], season_key)
+        selected = (payload.get("details") or {}).get("selectedSeason")
+        if selected and selected != season_key:
+            return pd.DataFrame(
+                columns=["date", "home", "away", "goals_home", "goals_away", "season"]
+            )
         rows = []
         for match in (payload.get("fixtures") or {}).get("allMatches") or []:
             status = match.get("status") or {}
             if not status.get("finished") or status.get("cancelled"):
+                continue
+            # Prefer regulation-time outcomes; skip shootout-only decisions.
+            reason = status.get("reason") or {}
+            reason_short = str(reason.get("short") or "").lower()
+            if reason_short in {"pen", "pens", "after pens"}:
                 continue
             score = parse_score(status.get("scoreStr"))
             kickoff = fotmob_kickoff(match)
@@ -417,18 +611,70 @@ def load_fotmob_results(league: dict) -> pd.DataFrame:
                     "away": match["away"]["name"],
                     "goals_home": score[0],
                     "goals_away": score[1],
-                    "season": season,
+                    "season": season_key,
                 }
             )
         return pd.DataFrame(rows)
 
-    frames = list(_HTTP.map(season_frame, (league["prior_season"], league["season"])))
+    frames = list(_HTTP.map(season_frame, (prior_season, season)))
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(
             columns=["date", "home", "away", "goals_home", "goals_away", "season"]
         )
     return pd.concat(frames, ignore_index=True)
+
+
+def augment_cup_with_parent_league(league: dict, cup_matches: pd.DataFrame) -> pd.DataFrame:
+    """Fold parent domestic-league results into cup training.
+
+    PL / LaLiga clubs often enter cups before they have a cup result this season.
+    Using FotMob parent-league results keeps team names aligned with cup fixtures.
+    """
+    parent_id = league.get("parent_league_id")
+    if not parent_id:
+        return cup_matches
+    parent = league_by_id(parent_id)
+    season, prior_season = resolve_fotmob_seasons(league)
+    parent_spec = {
+        "fotmob_id": parent["fotmob_id"],
+        "season": season if season in {"2026/2027", "2025/2026", "2024/2025"} else "2026/2027",
+        "prior_season": prior_season
+        if prior_season in {"2026/2027", "2025/2026", "2024/2025", "2023/2024"}
+        else "2025/2026",
+    }
+    # Prefer the parent's own configured FotMob seasons when available.
+    if parent.get("kind") == "fotmob":
+        parent_spec["season"] = parent.get("season", parent_spec["season"])
+        parent_spec["prior_season"] = parent.get("prior_season", parent_spec["prior_season"])
+    else:
+        # european leagues store YYXX codes; map to FotMob season labels.
+        parent_spec["season"] = "2026/2027"
+        parent_spec["prior_season"] = "2025/2026"
+    try:
+        parent_matches = load_fotmob_results(parent_spec)
+    except Exception:
+        return cup_matches
+    if parent_matches.empty:
+        return cup_matches
+    # Keep cup "current" counts pure: stash parent games under the cup prior season.
+    parent_matches = parent_matches.copy()
+    parent_matches["season"] = prior_season
+    combined = pd.concat([cup_matches, parent_matches], ignore_index=True)
+    combined = combined.drop_duplicates(
+        subset=["date", "home", "away", "goals_home", "goals_away"],
+        keep="first",
+    )
+    return combined.sort_values("date").reset_index(drop=True)
+
+
+def load_league(league: dict) -> pd.DataFrame:
+    if league["kind"] == "european":
+        return load_european(league)
+    if league["kind"] == "fotmob":
+        matches = load_fotmob_results(league)
+        return augment_cup_with_parent_league(league, matches)
+    return load_extra(league)
 
 
 def fold_keys(name: str) -> set[str]:
@@ -569,10 +815,13 @@ def fixture_dict(
 def league_fixtures(
     league: dict, catalog: list[str] | None = None, tz_name: str | None = None
 ) -> dict:
-    payload = fotmob_league_payload(
-        league["fotmob_id"], league.get("season") if league["kind"] == "fotmob" else None
-    )
+    season = fotmob_fixture_season(league)
+    payload = fotmob_league_payload(league["fotmob_id"], season)
     matches = (payload.get("fixtures") or {}).get("allMatches") or []
+    # Some cups publish the upcoming slate on the default season feed first.
+    if not matches and season:
+        payload = fotmob_league_payload(league["fotmob_id"], None)
+        matches = (payload.get("fixtures") or {}).get("allMatches") or []
     tz = resolve_tz(tz_name)
     now = datetime.now(timezone.utc)
     today = now.astimezone(tz).date()
@@ -1428,11 +1677,12 @@ def fit_league(
         raise ValueError(
             f"No completed matches before forecast cutoff for {league['name']}."
         )
-    current = trainable[trainable["season"] == league["season"]]
+    season_key, season_label = effective_season(league)
+    current = trainable[trainable["season"] == season_key]
     if current.empty:
         # Do not silently train only on prior season as if it were current.
         raise ValueError(
-            f"No {league['season_label']} matches before cutoff for {league['name']}. "
+            f"No {season_label} matches before cutoff for {league['name']}. "
             "Refusing to substitute older-season-only strengths."
         )
     weights = np.array(
@@ -1450,23 +1700,25 @@ def fit_league(
         )
     )
     model.fit()
-    season_teams = sorted(
-        set(matches.loc[matches["season"] == league["season"], "home"])
-        | set(matches.loc[matches["season"] == league["season"], "away"])
-    )
+    # Include every club the fitted model has strengths for (prior + current).
+    # Cup sides often appear in fixtures before they have a result this season.
+    model_teams = sorted(set(trainable["home"]) | set(trainable["away"]))
     latest_match = pd.to_datetime(trainable["date"], utc=True).max()
+    league_meta = dict(league)
+    league_meta["season"] = season_key
+    league_meta["season_label"] = season_label
     return {
-        "league": league,
+        "league": league_meta,
         "matches": matches,
         "trainable": trainable,
         "current": current,
-        "teams": season_teams,
+        "teams": model_teams,
         "model": model,
         "players": None,
         "player_error": None,
         "trained_on": len(trainable),
         "current_matches": len(current),
-        "prior_matches": int((trainable["season"] != league["season"]).sum()),
+        "prior_matches": int((trainable["season"] != season_key).sum()),
         "cutoff": cut.isoformat(),
         "xi": xi,
         "results_through": latest_match.date().isoformat(),
@@ -1486,22 +1738,43 @@ def get_league_catalog(league_id: str) -> dict:
             _CATALOG.move_to_end(league_id)
             return cached
     matches = load_league(league)
-    if matches.empty:
+    if matches.empty and league["kind"] != "fotmob":
         raise ValueError(f"No completed matches found for {league['name']}.")
-    current = matches[matches["season"] == league["season"]]
-    if current.empty:
+    season_key, season_label = effective_season(league)
+    current = (
+        matches[matches["season"] == season_key]
+        if not matches.empty
+        else matches
+    )
+    if current.empty and league["kind"] != "fotmob":
         raise ValueError(
-            f"No {league['season_label']} matches found for {league['name']} yet."
+            f"No {season_label} matches found for {league['name']} yet."
         )
-    teams = sorted(set(current["home"]) | set(current["away"]))
-    latest = pd.to_datetime(matches["date"], utc=True).max()
+    # Cups: keep prior-season clubs so PL/LaLiga sides remain selectable before
+    # their first result this campaign. League tables stay current-season only.
+    if league["kind"] == "fotmob" and not matches.empty:
+        team_source = matches
+    else:
+        team_source = current if not current.empty else matches
+    teams = (
+        sorted(set(team_source["home"]) | set(team_source["away"]))
+        if not team_source.empty
+        else []
+    )
+    latest = (
+        pd.to_datetime(matches["date"], utc=True).max().date().isoformat()
+        if not matches.empty
+        else None
+    )
     catalog = {
         "league": league,
         "teams": teams,
         "trained_on": len(matches),
         "current_matches": len(current),
-        "prior_matches": len(matches) - len(current),
-        "results_through": latest.date().isoformat(),
+        "prior_matches": max(0, len(matches) - len(current)),
+        "results_through": latest,
+        "season_label": season_label,
+        "season_key": season_key,
     }
     with _LOCK:
         _CATALOG[league_id] = catalog
@@ -1516,9 +1789,13 @@ def get_fixtures(league_id: str, tz_name: str | None = None) -> dict:
     packed = _FIXTURE_MEM.get(key)
     if packed and packed[0] > time.time():
         return packed[1]
-    catalog_state = get_league_catalog(league_id)
-    league = catalog_state["league"]
-    catalog = None if league["kind"] == "fotmob" else catalog_state["teams"]
+    league = league_by_id(league_id)
+    catalog = None
+    try:
+        catalog = get_league_catalog(league_id)["teams"]
+    except Exception:
+        # Still show FotMob fixtures even if results are temporarily unavailable.
+        catalog = None
     data = league_fixtures(league, catalog, tz_name)
     _FIXTURE_MEM[key] = (time.time() + FOTMOB_LIVE_TTL, data)
     while len(_FIXTURE_MEM) > MAX_FIXTURE_MEM:
@@ -1652,6 +1929,49 @@ def _players_for_state(state: dict):
             state["player_error"] = str(error)
 
 
+def predict_score_grid(model: DixonColesGoalModel, home: str, away: str):
+    """Predict a score grid, clipping rare Dixon–Coles negatives from extreme rho."""
+    try:
+        return model.predict(home, away, max_goals=MODEL_MAX_GOALS, normalize=True)
+    except ValueError as error:
+        if "negative probabilities" not in str(error):
+            raise
+    home_idx = int(model.team_to_idx[home])
+    away_idx = int(model.team_to_idx[away])
+    home_attack = float(model._params[home_idx])
+    away_attack = float(model._params[away_idx])
+    home_defense = float(model._params[home_idx + model.n_teams])
+    away_defense = float(model._params[away_idx + model.n_teams])
+    home_advantage = float(model._params[-2])
+    rho = float(model._params[-1])
+    flat = np.empty(MODEL_MAX_GOALS * MODEL_MAX_GOALS, dtype=np.float64)
+    lambda_home = np.empty(1, dtype=np.float64)
+    lambda_away = np.empty(1, dtype=np.float64)
+    compute_dixon_coles_probabilities(
+        home_attack,
+        away_attack,
+        home_defense,
+        away_defense,
+        home_advantage,
+        rho,
+        int(MODEL_MAX_GOALS),
+        flat,
+        lambda_home,
+        lambda_away,
+    )
+    grid = np.clip(flat.reshape(MODEL_MAX_GOALS, MODEL_MAX_GOALS), 0.0, None)
+    total = float(grid.sum())
+    if total <= 0:
+        raise ValueError("Could not form a valid score probability grid for this match.")
+    grid /= total
+    return FootballProbabilityGrid(
+        grid,
+        float(lambda_home.item()),
+        float(lambda_away.item()),
+        normalize=False,
+    )
+
+
 def build_prediction(
     league_id: str,
     home: str,
@@ -1698,7 +2018,7 @@ def build_prediction(
     if home == away:
         raise ValueError("Choose two different teams.")
 
-    prediction = state["model"].predict(home, away, max_goals=MODEL_MAX_GOALS, normalize=True)
+    prediction = predict_score_grid(state["model"], home, away)
     ranked = top_scores(prediction)
     combo_bundle = best_combos(prediction, home, away)
     singles = rank_single_selections(prediction, home, away, limit=3)

@@ -143,7 +143,9 @@ function FixtureCard(match, { showLeague = false } = {}) {
 }
 
 function FixtureCarousel(matches) {
-  if (!matches.length) return `<p class="status">No upcoming fixtures found.</p>`;
+  if (!matches.length) {
+    return `<p class="explain">${escapeHtml(leagueMeta.note || "No upcoming fixtures for this competition right now. Pick teams below to predict.")}</p>`;
+  }
   return `<div class="carousel">${matches.map((match) => FixtureCard(match)).join("")}</div>`;
 }
 
@@ -520,7 +522,7 @@ async function selectFixture(match, predictNow, fromUser) {
   const awayName = catalogName(match.away, match.away_source);
   highlightCarousel();
   if (!homeName || !awayName || homeName === awayName) {
-    status.innerHTML = `<span class="error">Could not map this fixture onto the model teams.</span>`;
+    status.innerHTML = `<span class="error">No model strength yet for one of these teams (no cup results in the training window).</span>`;
     return;
   }
   home.value = homeName;
@@ -643,7 +645,9 @@ async function loadTeams() {
     setOptions(home, data.teams, homePick);
     setOptions(away, data.teams, awayPick);
     home.disabled = away.disabled = false;
-    status.textContent = `${data.name} ${data.season}: ${data.current_matches} matches this season · model fits when you predict.`;
+    status.textContent = data.note
+      ? `${data.name} ${data.season}: ${data.note}`
+      : `${data.name} ${data.season}: ${data.current_matches} matches this season · model fits when you predict.`;
     paintCarousel();
     if (focus) await selectFixture(focus, true, false);
   } catch (error) {

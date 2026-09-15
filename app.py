@@ -55,21 +55,42 @@ def leagues():
 @app.get("/api/leagues/{league_id}/teams")
 def teams(league_id: str, tz: str | None = None):
     try:
-        league_by_id(league_id)
+        league = league_by_id(league_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Unknown league") from None
     try:
-        # Catalog + fixtures only — do not fit Dixon–Coles just to browse.
-        state = get_league_catalog(league_id)
         fixtures = get_fixtures(league_id, tz)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(
             status_code=503,
-            detail=f"Could not load league data ({error}). Try again in a minute.",
+            detail=f"Could not load fixtures ({error}). Try again in a minute.",
         ) from error
-    league = state["league"]
+    catalog_error = None
+    try:
+        state = get_league_catalog(league_id)
+    except Exception as error:
+        catalog_error = str(error)
+        fixture_teams = sorted(
+            {
+                *(item.get("home") for item in (fixtures.get("carousel") or []) if item.get("home")),
+                *(item.get("away") for item in (fixtures.get("carousel") or []) if item.get("away")),
+                *(item.get("home") for item in (fixtures.get("live") or []) if item.get("home")),
+                *(item.get("away") for item in (fixtures.get("live") or []) if item.get("away")),
+            }
+        )
+        state = {
+            "league": league,
+            "teams": fixture_teams,
+            "trained_on": 0,
+            "current_matches": 0,
+            "prior_matches": 0,
+            "results_through": None,
+        }
+        if not fixture_teams:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not load league data ({error}). Try again in a minute.",
+            ) from error
     focus = (
         fixtures["live"][0]
         if fixtures.get("live")
@@ -82,7 +103,7 @@ def teams(league_id: str, tz: str | None = None):
     return {
         "id": league["id"],
         "name": league["name"],
-        "season": league["season_label"],
+        "season": state.get("season_label") or league["season_label"],
         "teams": state["teams"],
         "trained_on": state["trained_on"],
         "current_matches": state["current_matches"],
@@ -99,7 +120,12 @@ def teams(league_id: str, tz: str | None = None):
         "carousel": fixtures.get("carousel") or [],
         "focus": focus,
         "model_ready": False,
-        "note": "Model fits on demand when you open a match prediction.",
+        "catalog_error": catalog_error,
+        "note": (
+            "No upcoming fixtures published yet — pick teams manually to predict."
+            if not (fixtures.get("carousel") or [])
+            else "Model fits on demand when you open a match prediction."
+        ),
     }
 
 

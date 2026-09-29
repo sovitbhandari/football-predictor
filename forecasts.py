@@ -108,9 +108,69 @@ def fixture_eligible_for_tracking(kickoff: str | None, generated_at: datetime | 
     return True
 
 
+def forecast_looks_sane(payload: dict | None) -> bool:
+    """Reject Dixon–Coles snapshots that were clearly poisoned (e.g. λ≈7, 99% wins)."""
+    if not payload:
+        return False
+    try:
+        xg_home = float(payload.get("xg_home"))
+        xg_away = float(payload.get("xg_away"))
+        probs = [
+            float(payload.get("home_win") or 0.0),
+            float(payload.get("draw") or 0.0),
+            float(payload.get("away_win") or 0.0),
+        ]
+    except (TypeError, ValueError):
+        return False
+    if xg_home < 0 or xg_away < 0:
+        return False
+    # Regulation football almost never has DC λ above ~4 from real strengths.
+    if xg_home > 4.0 or xg_away > 4.0:
+        return False
+    if max(probs) > 0.93:
+        return False
+    return True
+
+
+def purge_insane_forecasts() -> int:
+    """Drop frozen/pre-kickoff rows with impossible λ / win probs."""
+    init_store()
+    removed = 0
+    with _LOCK:
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT fixture_id, forecast_json, frozen_json FROM forecasts"
+            ).fetchall()
+            for row in rows:
+                keep = False
+                for blob in (row["frozen_json"], row["forecast_json"]):
+                    if not blob:
+                        continue
+                    try:
+                        payload = json.loads(blob)
+                    except json.JSONDecodeError:
+                        continue
+                    if forecast_looks_sane(payload):
+                        keep = True
+                        break
+                if not keep:
+                    conn.execute(
+                        "DELETE FROM forecasts WHERE fixture_id = ?",
+                        (row["fixture_id"],),
+                    )
+                    removed += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return removed
+
+
 def save_live_forecast(fixture_id: str, payload: dict) -> dict:
     """Upsert the latest pre-kickoff forecast. Never overwrite a frozen snapshot."""
     init_store()
+    if not forecast_looks_sane(payload):
+        return {"saved": False, "reason": "forecast_failed_sanity_check"}
     now = _utc_now().isoformat()
     kickoff = payload.get("kickoff")
     if not fixture_eligible_for_tracking(kickoff, _utc_now()):
@@ -242,6 +302,8 @@ def get_frozen(fixture_id: str) -> dict | None:
                 data["actual"] = json.loads(row["actual_json"])
             data["snapshot_status"] = row["status"]
             data["frozen_at"] = row["frozen_at"]
+            if not forecast_looks_sane(data):
+                return None
             return data
         finally:
             conn.close()

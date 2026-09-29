@@ -8,7 +8,7 @@ import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,8 @@ from penaltyblog.models.football_probability_grid import FootballProbabilityGrid
 
 import forecasts as forecast_store
 import form as form_analysis
+import api_football
+import ensemble
 from markets import best_combos, rank_single_selections
 
 USER_AGENT = "Mozilla/5.0"
@@ -34,13 +36,19 @@ MODEL_MAX_GOALS = 15
 EURO_BASE = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 EXTRA_BASE = "https://www.football-data.co.uk/new/{code}.csv"
 FOTMOB_LEAGUE = "https://www.fotmob.com/api/data/leagues?id={league_id}"
+FOTMOB_MATCH_DETAILS = "https://www.fotmob.com/api/data/matchDetails"
 FOTMOB_HEADERS = {"User-Agent": USER_AGENT}
 FOTMOB_CREST = "https://images.fotmob.com/image_resources/logo/teamlogo/{team_id}.png"
 FOTMOB_PLAYER = "https://images.fotmob.com/image_resources/playerimages/{player_id}.png"
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 CSV_TTL = 6 * 3600
+# Assembled live-board refresh cadence (UI poll). Raw FotMob league JSON uses
+# FOTMOB_PAYLOAD_TTL so live polls do not re-download every competition.
 FOTMOB_LIVE_TTL = 45
+FOTMOB_PAYLOAD_TTL = 180
+FOTMOB_BROWSE_TTL = 900
 FOTMOB_SEASON_TTL = 6 * 3600
+FOTMOB_MATCH_TTL = 5 * 60
 # Regulation + ET buffer; anything older without a finished flag is not "live".
 MAX_MATCH_LIVE_SECONDS = int(3.5 * 3600)
 STARTING_SOON_LIVE_SECONDS = 15 * 60
@@ -62,7 +70,7 @@ PLAYER_TTL = 3 * 3600
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": USER_AGENT})
-_HTTP = ThreadPoolExecutor(max_workers=8)
+_HTTP = ThreadPoolExecutor(max_workers=12)
 
 LEAGUES = [
     {
@@ -138,6 +146,66 @@ LEAGUES = [
         "prior_season": "2025/2026",
         "season_label": "2026/27",
         "fotmob_id": 10216,
+    },
+    {
+        "id": "uefa-nations-league-a",
+        "name": "UEFA Nations League A",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2024/2025",
+        "season_label": "2026/27",
+        "fotmob_id": 9806,
+    },
+    {
+        "id": "uefa-nations-league-b",
+        "name": "UEFA Nations League B",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2024/2025",
+        "season_label": "2026/27",
+        "fotmob_id": 9807,
+    },
+    {
+        "id": "uefa-nations-league-c",
+        "name": "UEFA Nations League C",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2024/2025",
+        "season_label": "2026/27",
+        "fotmob_id": 9808,
+    },
+    {
+        "id": "uefa-nations-league-d",
+        "name": "UEFA Nations League D",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2024/2025",
+        "season_label": "2026/27",
+        "fotmob_id": 9809,
+    },
+    {
+        "id": "world-cup-qual-uefa",
+        "name": "World Cup Qualification UEFA",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2025/2026",
+        "prior_season": "2021/2022",
+        "season_label": "2025/26",
+        "fotmob_id": 10195,
+    },
+    {
+        "id": "euro",
+        "name": "EURO",
+        "country": "Europe",
+        "kind": "fotmob",
+        "season": "2028",
+        "prior_season": "2024",
+        "season_label": "2028",
+        "fotmob_id": 50,
     },
     {
         "id": "laliga",
@@ -218,6 +286,46 @@ LEAGUES = [
         "fotmob_id": 268,
     },
     {
+        "id": "copa-libertadores",
+        "name": "Copa Libertadores",
+        "country": "South America",
+        "kind": "fotmob",
+        "season": "2026",
+        "prior_season": "2025",
+        "season_label": "2026",
+        "fotmob_id": 45,
+    },
+    {
+        "id": "copa-sudamericana",
+        "name": "Copa Sudamericana",
+        "country": "South America",
+        "kind": "fotmob",
+        "season": "2026",
+        "prior_season": "2025",
+        "season_label": "2026",
+        "fotmob_id": 299,
+    },
+    {
+        "id": "copa-america",
+        "name": "Copa América",
+        "country": "South America",
+        "kind": "fotmob",
+        "season": "2024",
+        "prior_season": "2021",
+        "season_label": "2024",
+        "fotmob_id": 44,
+    },
+    {
+        "id": "world-cup-qual-conmebol",
+        "name": "World Cup Qualification CONMEBOL",
+        "country": "South America",
+        "kind": "fotmob",
+        "season": "2023/2025",
+        "prior_season": "2020/2022",
+        "season_label": "2023/25",
+        "fotmob_id": 10199,
+    },
+    {
         "id": "primeira-liga",
         "name": "Primeira Liga",
         "country": "Portugal",
@@ -263,7 +371,107 @@ LEAGUES = [
         "league_name": "MLS",
         "fotmob_id": 130,
     },
+    {
+        "id": "concacaf-champions-cup",
+        "name": "CONCACAF Champions Cup",
+        "country": "North America",
+        "kind": "fotmob",
+        "season": "2026",
+        "prior_season": "2025",
+        "season_label": "2026",
+        "fotmob_id": 297,
+    },
+    {
+        "id": "leagues-cup",
+        "name": "Leagues Cup",
+        "country": "North America",
+        "kind": "fotmob",
+        "season": "2026",
+        "prior_season": "2025",
+        "season_label": "2026",
+        "fotmob_id": 10043,
+    },
+    {
+        "id": "concacaf-gold-cup",
+        "name": "CONCACAF Gold Cup",
+        "country": "North America",
+        "kind": "fotmob",
+        "season": "2025",
+        "prior_season": "2023",
+        "season_label": "2025",
+        "fotmob_id": 298,
+    },
+    {
+        "id": "concacaf-nations-league",
+        "name": "CONCACAF Nations League",
+        "country": "North America",
+        "kind": "fotmob",
+        "season": "2026/2027",
+        "prior_season": "2024/2025",
+        "season_label": "2026/27",
+        "fotmob_id": 9821,
+    },
+    {
+        "id": "world-cup-qual-concacaf",
+        "name": "World Cup Qualification CONCACAF",
+        "country": "North America",
+        "kind": "fotmob",
+        "season": "2024/2025",
+        "prior_season": "2021/2022",
+        "season_label": "2024/25",
+        "fotmob_id": 10198,
+    },
+    {
+        "id": "international-friendlies",
+        "name": "International Friendlies",
+        "country": "International",
+        "kind": "fotmob",
+        "season": "2026",
+        "prior_season": "2025",
+        "season_label": "2026",
+        "fotmob_id": 114,
+    },
 ]
+
+
+# Primary top-nav competitions; everything else goes under Other.
+MAIN_NAV_IDS = (
+    "premier-league",
+    "laliga",
+    "bundesliga",
+    "serie-a",
+    "ligue-1",
+)
+# Multi-nation cups/international comps: seed newcomers from fixtures/results.
+ROTATING_COMP_IDS = frozenset(
+    {
+        "ucl",
+        "uel",
+        "uecl",
+        "uefa-nations-league-a",
+        "uefa-nations-league-b",
+        "uefa-nations-league-c",
+        "uefa-nations-league-d",
+        "world-cup-qual-uefa",
+        "euro",
+        "copa-libertadores",
+        "copa-sudamericana",
+        "copa-america",
+        "world-cup-qual-conmebol",
+        "concacaf-champions-cup",
+        "leagues-cup",
+        "concacaf-gold-cup",
+        "concacaf-nations-league",
+        "world-cup-qual-concacaf",
+        "international-friendlies",
+    }
+)
+UEFA_COMP_IDS = ROTATING_COMP_IDS
+LEAGUE_AVERAGE_TEAM = "League Average"
+
+HOME_DAY_TTL = 300
+_HOME_DAY: dict[str, tuple[float, dict]] = {}
+
 
 TEAM_HINTS = {
     "ath madrid": "atletico madrid",
@@ -350,6 +558,9 @@ TEAM_HINTS = {
     "swansea city": "swansea",
     "watford": "watford",
     "wrexham": "wrexham",
+    "bayern munchen": "bayern munich",
+    "fc bayern munchen": "bayern munich",
+    "fc bayern munich": "bayern munich",
 }
 
 _CACHE: OrderedDict[str, dict] = OrderedDict()
@@ -357,11 +568,12 @@ _CATALOG: OrderedDict[str, dict] = OrderedDict()
 _CRESTS = {}
 _HTTP_MEM = {}
 _FIXTURE_MEM = {}
-_LIVE_BOARD = {"expires": 0.0, "rows": []}
+_LIVE_BOARD = {"expires": 0.0, "rows": [], "payload": None}
 MAX_LEAGUE_CACHE = 2
 MAX_CATALOG_CACHE = 20
-MAX_HTTP_MEM = 24
-MAX_FIXTURE_MEM = 16
+# 18 competitions × season variants + CSVs; small caps thrash and re-hit disk/network.
+MAX_HTTP_MEM = 128
+MAX_FIXTURE_MEM = 48
 _LOCK = threading.Lock()
 _FIT_EVENTS = {}
 _PLAYER_LOCKS = {}
@@ -485,9 +697,15 @@ def fotmob_league_payload(
     season: str | None = None,
     *,
     live: bool = False,
+    browse: bool = False,
 ) -> dict:
-    # Fixture/live boards must not reuse the multi-hour historical season cache.
-    ttl = FOTMOB_LIVE_TTL if live or season is None else FOTMOB_SEASON_TTL
+    # Fixture feeds (live + browse) share one payload TTL so 45s live polls
+    # reassemble from cache instead of re-downloading every league.
+    # Explicit season fits still use the long historical TTL.
+    if live or browse or season is None:
+        ttl = FOTMOB_BROWSE_TTL if browse else FOTMOB_PAYLOAD_TTL
+    else:
+        ttl = FOTMOB_SEASON_TTL
     params = {"season": season} if season else None
     return fetch_json(
         FOTMOB_LEAGUE.format(league_id=league_id),
@@ -571,18 +789,22 @@ def effective_season(league: dict) -> tuple[str, str]:
 
 
 def fotmob_fixture_season(league: dict) -> str | None:
-    """Season query for upcoming fixtures; None when the configured year is unpublished."""
+    """Season query for upcoming fixtures; avoid extra round-trips when possible."""
     if league.get("kind") != "fotmob":
         return None
-    payload = fotmob_league_payload(league["fotmob_id"], None)
-    available = payload.get("allAvailableSeasons") or []
     wanted = league.get("season")
-    if not wanted or wanted not in available:
+    if not wanted:
         return None
-    check = fotmob_league_payload(league["fotmob_id"], wanted)
-    selected = (check.get("details") or {}).get("selectedSeason")
-    if selected and selected != wanted:
+    # One lightweight default payload to validate the configured season exists.
+    payload = fotmob_league_payload(league["fotmob_id"], None, live=True)
+    available = payload.get("allAvailableSeasons") or []
+    if wanted not in available:
         return None
+    selected = (payload.get("details") or {}).get("selectedSeason")
+    latest = (payload.get("details") or {}).get("latestSeason")
+    # If the default feed already selected our season, callers can pass None.
+    if selected == wanted or latest == wanted:
+        return wanted
     return wanted
 
 
@@ -605,6 +827,19 @@ def fotmob_kickoff(match: dict) -> datetime | None:
 
 def load_fotmob_results(league: dict) -> pd.DataFrame:
     season, prior_season = resolve_fotmob_seasons(league)
+    seasons = [prior_season, season]
+    # UEFA sides rotate heavily; keep one extra completed campaign when available.
+    if league.get("id") in UEFA_COMP_IDS:
+        try:
+            available = list(
+                (fotmob_league_payload(league["fotmob_id"], None).get("allAvailableSeasons") or [])
+            )
+            if prior_season in available:
+                idx = available.index(prior_season)
+                if idx + 1 < len(available) and available[idx + 1] not in seasons:
+                    seasons = [available[idx + 1], prior_season, season]
+        except Exception:
+            pass
 
     def season_frame(season_key: str) -> pd.DataFrame:
         payload = fotmob_league_payload(league["fotmob_id"], season_key)
@@ -639,13 +874,31 @@ def load_fotmob_results(league: dict) -> pd.DataFrame:
             )
         return pd.DataFrame(rows)
 
-    frames = list(_HTTP.map(season_frame, (prior_season, season)))
+    frames = list(_HTTP.map(season_frame, seasons))
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(
             columns=["date", "home", "away", "goals_home", "goals_away", "season"]
         )
     return pd.concat(frames, ignore_index=True)
+
+
+def fotmob_fixture_team_names(league: dict) -> set[str]:
+    """Current-season squad list from FotMob fixtures (includes unplayed clubs)."""
+    season, _ = resolve_fotmob_seasons(league)
+    try:
+        payload = fotmob_league_payload(league["fotmob_id"], season, browse=True)
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for match in (payload.get("fixtures") or {}).get("allMatches") or []:
+        home = (match.get("home") or {}).get("name")
+        away = (match.get("away") or {}).get("name")
+        if home:
+            names.add(str(home).strip())
+        if away:
+            names.add(str(away).strip())
+    return {name for name in names if name}
 
 
 def augment_cup_with_parent_league(league: dict, cup_matches: pd.DataFrame) -> pd.DataFrame:
@@ -703,10 +956,19 @@ def load_league(league: dict) -> pd.DataFrame:
 def fold_keys(name: str) -> set[str]:
     base = fold_name(name)
     keys = {base, base.replace("y", "")}
+    # FotMob uses München; football-data.co.uk uses Munich.
+    if "munchen" in base:
+        keys.add(base.replace("munchen", "munich"))
+    if "munich" in base:
+        keys.add(base.replace("munich", "munchen"))
     hinted = TEAM_HINTS.get(base)
     if hinted:
         keys.add(hinted)
         keys.add(hinted.replace("y", ""))
+        if "munchen" in hinted:
+            keys.add(hinted.replace("munchen", "munich"))
+        if "munich" in hinted:
+            keys.add(hinted.replace("munich", "munchen"))
     return {key for key in keys if key}
 
 
@@ -951,29 +1213,247 @@ def live_matches_for_league(league: dict, now: datetime | None = None) -> list[d
 def get_live_board(tz_name: str | None = None) -> dict:
     tz = resolve_tz(tz_name)
     now = datetime.now(timezone.utc)
-    if _LIVE_BOARD["expires"] > time.time():
-        rows = _LIVE_BOARD["rows"]
-    else:
-        def one(league: dict) -> list[dict]:
-            try:
-                return live_matches_for_league(league, now)
-            except Exception:
-                return []
+    cached = _LIVE_BOARD if _LIVE_BOARD.get("expires", 0) > time.time() else None
+    if cached and cached.get("payload"):
+        payload = dict(cached["payload"])
+        payload["as_of"] = now.astimezone(tz).isoformat()
+        payload["timezone"] = getattr(tz, "key", str(tz))
+        return payload
 
-        rows = []
-        for group in _HTTP.map(one, LEAGUES):
-            rows.extend(group)
-        rows.sort(
-            key=lambda item: (item.get("league_name") or "", item.get("kickoff") or "")
-        )
-        _LIVE_BOARD["rows"] = rows
-        _LIVE_BOARD["expires"] = time.time() + FOTMOB_LIVE_TTL
-    return {
+    errors: list[dict] = []
+    rows: list[dict] = []
+
+    def one(league: dict) -> tuple[str, list[dict], str | None]:
+        try:
+            return league["id"], live_matches_for_league(league, now), None
+        except Exception as error:
+            return league["id"], [], str(error)
+
+    for league_id, group, err in _HTTP.map(one, LEAGUES):
+        if err:
+            errors.append({"league_id": league_id, "error": err})
+        rows.extend(group)
+    rows.sort(
+        key=lambda item: (item.get("league_name") or "", item.get("kickoff") or "")
+    )
+    if errors and rows:
+        retrieval = "partial"
+    elif errors and not rows:
+        retrieval = "error"
+    else:
+        retrieval = "ok"
+    payload = {
         "as_of": now.astimezone(tz).isoformat(),
         "timezone": getattr(tz, "key", str(tz)),
         "count": len(rows),
         "live": rows,
+        "retrieval": retrieval,
+        "errors": errors,
+        "competitions_total": len(LEAGUES),
+        "competitions_failed": len(errors),
+        "poll_seconds": FOTMOB_LIVE_TTL,
+        "message": (
+            "Live scores could not be retrieved."
+            if retrieval == "error"
+            else (
+                f"Live board partial: {len(errors)} competition(s) failed."
+                if retrieval == "partial"
+                else (
+                    "No live games across supported competitions right now."
+                    if not rows
+                    else None
+                )
+            )
+        ),
     }
+    _LIVE_BOARD["rows"] = rows
+    _LIVE_BOARD["payload"] = payload
+    _LIVE_BOARD["expires"] = time.time() + FOTMOB_LIVE_TTL
+    return payload
+
+
+def league_logo_url(league: dict) -> str | None:
+    fotmob_id = league.get("fotmob_id")
+    if not fotmob_id:
+        return None
+    return f"https://images.fotmob.com/image_resources/logo/leaguelogo/{fotmob_id}.png"
+
+
+def nav_leagues() -> dict:
+    main = [league for league in LEAGUES if league["id"] in MAIN_NAV_IDS]
+    # Keep main order as MAIN_NAV_IDS
+    main_ordered = []
+    by_id = {league["id"]: league for league in LEAGUES}
+    for league_id in MAIN_NAV_IDS:
+        if league_id in by_id:
+            main_ordered.append(by_id[league_id])
+    other = [league for league in LEAGUES if league["id"] not in MAIN_NAV_IDS]
+    def pack(league: dict) -> dict:
+        return {
+            "id": league["id"],
+            "name": league["name"],
+            "country": league["country"],
+            "season": league["season_label"],
+            "logo": league_logo_url(league),
+        }
+    return {
+        "home": {"id": "home", "name": "Home"},
+        "main": [pack(league) for league in main_ordered],
+        "other": [pack(league) for league in other],
+        "all": [pack(league) for league in LEAGUES],
+    }
+
+
+def _local_date(iso: str | None, tz) -> date | None:
+    kickoff = parse_iso(iso)
+    if not kickoff:
+        return None
+    return kickoff.astimezone(tz).date()
+
+
+def _parse_browse_date(date_str: str | None, tz) -> date:
+    if date_str:
+        try:
+            return date.fromisoformat(date_str)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).astimezone(tz).date()
+
+
+def fixtures_for_league_on_date(
+    league: dict,
+    day: date,
+    tz_name: str | None = None,
+) -> dict:
+    """Lightweight dated fixtures for one competition (no model fit)."""
+    tz = resolve_tz(tz_name)
+    now = datetime.now(timezone.utc)
+    try:
+        catalog = None
+        # Prefer a single live payload. Season param only when needed for cups.
+        season = None
+        if league.get("kind") == "fotmob":
+            season = league.get("season")
+        payload = fotmob_league_payload(league["fotmob_id"], season, browse=True)
+        matches = (payload.get("fixtures") or {}).get("allMatches") or []
+        selected = (payload.get("details") or {}).get("selectedSeason")
+        # Unpublished cup seasons silently remap; fall back to default feed.
+        if season and selected and selected != season:
+            payload = fotmob_league_payload(league["fotmob_id"], None, browse=True)
+            matches = (payload.get("fixtures") or {}).get("allMatches") or []
+        if not matches and season:
+            payload = fotmob_league_payload(league["fotmob_id"], None, browse=True)
+            matches = (payload.get("fixtures") or {}).get("allMatches") or []
+        scheduled, live, finished = [], [], []
+        seen = set()
+        for match in matches:
+            item = fixture_dict(match, catalog, now, league["id"])
+            item["league_id"] = league["id"]
+            item["league_name"] = league["name"]
+            item["country"] = league["country"]
+            key = fixture_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            local = _local_date(item.get("kickoff"), tz)
+            if local != day:
+                continue
+            if item.get("status") == "live":
+                live.append(item)
+            elif item.get("status") == "finished":
+                finished.append(item)
+            elif item.get("status") == "scheduled":
+                scheduled.append(item)
+        scheduled.sort(key=lambda item: item.get("kickoff") or "")
+        live.sort(key=lambda item: item.get("kickoff") or "")
+        return {
+            "id": league["id"],
+            "name": league["name"],
+            "country": league["country"],
+            "season": league["season_label"],
+            "logo": league_logo_url(league),
+            "date": day.isoformat(),
+            "timezone": getattr(tz, "key", str(tz)),
+            "as_of": now.astimezone(tz).isoformat(),
+            "status": "ok",
+            "error": None,
+            "live": live,
+            "scheduled": scheduled,
+            "finished": finished,
+            "fixtures": scheduled,
+        }
+    except Exception as error:
+        return {
+            "id": league["id"],
+            "name": league["name"],
+            "country": league["country"],
+            "season": league["season_label"],
+            "logo": league_logo_url(league),
+            "date": day.isoformat(),
+            "timezone": getattr(tz, "key", str(tz)),
+            "as_of": now.astimezone(tz).isoformat(),
+            "status": "error",
+            "error": str(error),
+            "live": [],
+            "scheduled": [],
+            "finished": [],
+            "fixtures": [],
+        }
+
+
+def get_browse_board(
+    date_str: str | None = None,
+    tz_name: str | None = None,
+    league_id: str | None = None,
+    scope: str = "all",
+) -> dict:
+    """Home / league browse board: dated competition panels (live is separate)."""
+    tz = resolve_tz(tz_name)
+    day = _parse_browse_date(date_str, tz)
+    scope = (scope or "all").lower()
+    if scope not in {"all", "main", "other"}:
+        scope = "all"
+    cache_key = f"{day.isoformat()}|{getattr(tz, 'key', str(tz))}|{league_id or '*'}|{scope}"
+    packed = _HOME_DAY.get(cache_key)
+    if packed and packed[0] > time.time():
+        data = dict(packed[1])
+        live_cached = _LIVE_BOARD.get("payload") if _LIVE_BOARD.get("expires", 0) > time.time() else None
+        if live_cached:
+            data["live"] = live_cached
+        return data
+
+    if league_id:
+        leagues = [league_by_id(league_id)]
+    elif scope == "main":
+        by_id = {league["id"]: league for league in LEAGUES}
+        leagues = [by_id[i] for i in MAIN_NAV_IDS if i in by_id]
+    elif scope == "other":
+        leagues = [league for league in LEAGUES if league["id"] not in MAIN_NAV_IDS]
+    else:
+        leagues = list(LEAGUES)
+
+    def one(league: dict) -> dict:
+        return fixtures_for_league_on_date(league, day, tz_name)
+
+    panels = list(_HTTP.map(one, leagues))
+
+    live_cached = _LIVE_BOARD.get("payload") if _LIVE_BOARD.get("expires", 0) > time.time() else None
+    data = {
+        "date": day.isoformat(),
+        "timezone": getattr(tz, "key", str(tz)),
+        "as_of": datetime.now(timezone.utc).astimezone(tz).isoformat(),
+        "live": live_cached,
+        "competitions": panels,
+        "scope": scope,
+        "next_date_with_fixtures": None,
+        "empty": not any(panel.get("fixtures") for panel in panels),
+    }
+    if data["empty"]:
+        data["next_date_with_fixtures"] = (day + timedelta(days=1)).isoformat()
+    _HOME_DAY[cache_key] = (time.time() + HOME_DAY_TTL, data)
+    while len(_HOME_DAY) > 48:
+        _HOME_DAY.pop(next(iter(_HOME_DAY)))
+    return data
 
 
 def combo_markets(prediction, home: str, away: str) -> list[tuple[str, float]]:
@@ -1253,6 +1733,17 @@ def predicted_1x2(prediction, home: str, away: str) -> tuple[str, str, float]:
         float(prediction.draw),
         float(prediction.away_win),
     )
+    if home_win >= draw and home_win >= away_win:
+        return "home", f"{home} win", home_win
+    if away_win >= home_win and away_win >= draw:
+        return "away", f"{away} win", away_win
+    return "draw", "Draw", draw
+
+
+def predicted_1x2_from_probs(probs: dict, home: str, away: str) -> tuple[str, str, float]:
+    home_win = float(probs.get("home_win") or 0.0)
+    draw = float(probs.get("draw") or 0.0)
+    away_win = float(probs.get("away_win") or 0.0)
     if home_win >= draw and home_win >= away_win:
         return "home", f"{home} win", home_win
     if away_win >= home_win and away_win >= draw:
@@ -1648,6 +2139,156 @@ def players_as_dicts(frame: pd.DataFrame) -> list[dict]:
     return rows
 
 
+def _empty_impact_layer() -> dict:
+    return {
+        "included_in_model": False,
+        "status": "context_only",
+        "summary": (
+            "Lineups, injuries/suspensions and player club form are displayed when "
+            "available, but they do not change probabilities until a validated "
+            "player-impact model is trained."
+        ),
+        "lineups": {"available": False, "included_in_model": False, "teams": []},
+        "injuries": {"available": False, "included_in_model": False, "players": []},
+        "player_form": {
+            "available": False,
+            "included_in_model": False,
+            "source": None,
+            "note": "Player attacking form could not be mapped for this fixture.",
+        },
+        "model_policy": [
+            "Never treats predicted lineups as confirmed.",
+            "Never invents player absences or form.",
+            "No player bonus/penalty is applied without historical validation.",
+        ],
+    }
+
+
+def _pack_player_context(players: pd.DataFrame, team: str, limit: int = 5) -> list[dict]:
+    squad = players.loc[players["team"] == team].copy()
+    if squad.empty:
+        return []
+    squad["attack_signal"] = (
+        squad["xg"].astype(float)
+        + 0.75 * squad["xa"].astype(float)
+        + 0.55 * squad["goals"].astype(float)
+        + 0.35 * squad["assists"].astype(float)
+    )
+    squad["per90_signal"] = squad.apply(
+        lambda row: float(row.attack_signal) * 90.0 / max(float(row.minutes), 1.0),
+        axis=1,
+    )
+    squad = squad.sort_values(["attack_signal", "per90_signal"], ascending=False).head(limit)
+    return [
+        {
+            "player": row.player,
+            "team": row.team,
+            "goals": int(row.goals),
+            "assists": int(row.assists),
+            "xg": float(row.xg),
+            "xa": float(row.xa),
+            "minutes": int(row.minutes),
+            "matches": int(row.matches),
+            "attack_signal": float(row.attack_signal),
+            "per90_signal": float(row.per90_signal),
+            "included_in_model": False,
+        }
+        for row in squad.itertuples()
+    ]
+
+
+def fotmob_match_details(match_id: str | int | None) -> dict | None:
+    if not match_id:
+        return None
+    try:
+        return fetch_json(
+            FOTMOB_MATCH_DETAILS,
+            ttl=FOTMOB_MATCH_TTL,
+            params={"matchId": str(match_id)},
+        )
+    except Exception:
+        return None
+
+
+def _fotmob_player_name(row: dict) -> str:
+    return str(row.get("name") or " ".join([str(row.get("firstName") or ""), str(row.get("lastName") or "")]).strip())
+
+
+def fotmob_match_impact(match_id: str | int | None) -> dict:
+    details = fotmob_match_details(match_id)
+    packed = {
+        "available": False,
+        "lineups": None,
+        "injuries": None,
+        "note": "FotMob match details are unavailable for this fixture.",
+    }
+    if not details:
+        return packed
+    content = details.get("content") or {}
+    lineup = content.get("lineup") or {}
+    teams = []
+    injuries = []
+    for side_key in ("homeTeam", "awayTeam"):
+        team = lineup.get(side_key) or {}
+        if not team:
+            continue
+        starters = team.get("starters") or []
+        subs = team.get("subs") or []
+        unavailable = team.get("unavailable") or []
+        teams.append(
+            {
+                "team": team.get("name"),
+                "formation": team.get("formation"),
+                "source": lineup.get("source") or "FotMob",
+                "lineup_type": lineup.get("lineupType"),
+                "players": [_fotmob_player_name(row) for row in starters if _fotmob_player_name(row)],
+                "starters": [
+                    {
+                        "player": _fotmob_player_name(row),
+                        "position_id": row.get("positionId"),
+                        "shirt_number": row.get("shirtNumber"),
+                        "club": row.get("primaryTeamName"),
+                        "market_value": row.get("marketValue"),
+                    }
+                    for row in starters
+                ],
+                "subs": [_fotmob_player_name(row) for row in subs if _fotmob_player_name(row)],
+            }
+        )
+        for row in unavailable:
+            unavailability = row.get("unavailability") or {}
+            injuries.append(
+                {
+                    "team": team.get("name"),
+                    "player": _fotmob_player_name(row),
+                    "type": unavailability.get("type") or "unavailable",
+                    "reason": unavailability.get("type") or "unavailable",
+                    "expected_return": unavailability.get("expectedReturn"),
+                    "market_value": row.get("marketValue"),
+                    "source": "FotMob",
+                }
+            )
+    if teams:
+        packed["available"] = True
+        packed["lineups"] = {
+            "available": True,
+            "source": "FotMob",
+            "included_in_model": False,
+            "lineup_type": lineup.get("lineupType"),
+            "teams": teams,
+        }
+        packed["note"] = "FotMob match details provide lineups for this fixture."
+    if injuries:
+        packed["injuries"] = {
+            "available": True,
+            "source": "FotMob",
+            "included_in_model": False,
+            "players": injuries,
+            "note": "FotMob unavailable players are shown as context only.",
+        }
+    return packed
+
+
 def dixon_coles_meta(model) -> dict:
     meta = {
         "model": "Dixon–Coles",
@@ -1742,7 +2383,11 @@ def fit_league(
     model.fit()
     # Include every club the fitted model has strengths for (prior + current).
     # Cup sides often appear in fixtures before they have a result this season.
-    model_teams = sorted(set(trainable["home"]) | set(trainable["away"]))
+    model_teams = sorted(
+        name
+        for name in (set(trainable["home"]) | set(trainable["away"]))
+        if name != LEAGUE_AVERAGE_TEAM
+    )
     latest_match = pd.to_datetime(trainable["date"], utc=True).max()
     league_meta = dict(league)
     league_meta["season"] = season_key
@@ -1801,6 +2446,11 @@ def get_league_catalog(league_id: str) -> dict:
         if not team_source.empty
         else []
     )
+    teams = [name for name in teams if name != LEAGUE_AVERAGE_TEAM]
+    # UEFA: include clubs on the current fixture list even before they have a result.
+    if league["id"] in UEFA_COMP_IDS:
+        teams = sorted(set(teams) | fotmob_fixture_team_names(league))
+        teams = [name for name in teams if name != LEAGUE_AVERAGE_TEAM]
     latest = (
         pd.to_datetime(matches["date"], utc=True).max().date().isoformat()
         if not matches.empty
@@ -1969,19 +2619,45 @@ def _players_for_state(state: dict):
             state["player_error"] = str(error)
 
 
+def _median_team_strengths(model: DixonColesGoalModel) -> tuple[float, float]:
+    """Competition-average attack/defense for clubs with no fitted history."""
+    n = int(model.n_teams)
+    teams = [str(name) for name in model.teams]
+    attack = np.asarray(model._params[:n], dtype=float)
+    defense = np.asarray(model._params[n : 2 * n], dtype=float)
+    keep = np.array([name != LEAGUE_AVERAGE_TEAM for name in teams], dtype=bool)
+    if not keep.any():
+        keep = np.ones(n, dtype=bool)
+    return float(np.median(attack[keep])), float(np.median(defense[keep]))
+
+
+def _team_attack_defense(
+    model: DixonColesGoalModel, team: str, fallback: tuple[float, float]
+) -> tuple[float, float]:
+    idx_map = getattr(model, "team_to_idx", None) or {}
+    if team in idx_map:
+        idx = int(idx_map[team])
+        return float(model._params[idx]), float(model._params[idx + model.n_teams])
+    return fallback
+
+
 def predict_score_grid(model: DixonColesGoalModel, home: str, away: str):
-    """Predict a score grid, clipping rare Dixon–Coles negatives from extreme rho."""
-    try:
-        return model.predict(home, away, max_goals=MODEL_MAX_GOALS, normalize=True)
-    except ValueError as error:
-        if "negative probabilities" not in str(error):
-            raise
-    home_idx = int(model.team_to_idx[home])
-    away_idx = int(model.team_to_idx[away])
-    home_attack = float(model._params[home_idx])
-    away_attack = float(model._params[away_idx])
-    home_defense = float(model._params[home_idx + model.n_teams])
-    away_defense = float(model._params[away_idx + model.n_teams])
+    """Predict a score grid, clipping rare Dixon–Coles negatives from extreme rho.
+
+    Teams missing from the fitted catalog (new UEFA qualifiers, etc.) use the
+    competition median attack/defense instead of synthetic training rows.
+    """
+    idx_map = getattr(model, "team_to_idx", None) or {}
+    known = home in idx_map and away in idx_map
+    if known:
+        try:
+            return model.predict(home, away, max_goals=MODEL_MAX_GOALS, normalize=True)
+        except ValueError as error:
+            if "negative probabilities" not in str(error):
+                raise
+    fallback = _median_team_strengths(model)
+    home_attack, home_defense = _team_attack_defense(model, home, fallback)
+    away_attack, away_defense = _team_attack_defense(model, away, fallback)
     home_advantage = float(model._params[-2])
     rho = float(model._params[-1])
     flat = np.empty(MODEL_MAX_GOALS * MODEL_MAX_GOALS, dtype=np.float64)
@@ -2012,6 +2688,164 @@ def predict_score_grid(model: DixonColesGoalModel, home: str, away: str):
     )
 
 
+def apply_lineup_to_score_grid(prediction, lineup_1x2: dict | None):
+    """Apply a conservative lineup-strength tilt to the fitted score grid.
+
+    This preserves the Dixon-Coles score-cell structure and only reweights
+    score cells when both teams have provider lineup market values. It is an
+    experimental availability adjustment, not a fully trained player model.
+    """
+    if not lineup_1x2:
+        return prediction, {"applied": False, "reason": "no lineup value signal"}
+    home_value = float(lineup_1x2.get("home_adjusted_value") or 0.0)
+    away_value = float(lineup_1x2.get("away_adjusted_value") or 0.0)
+    if home_value <= 0 or away_value <= 0:
+        return prediction, {"applied": False, "reason": "missing lineup values"}
+
+    log_ratio = float(np.log((home_value + 1.0) / (away_value + 1.0)))
+    raw_tilt = 0.045 * log_ratio
+    tilt = float(np.clip(raw_tilt, -0.10, 0.10))
+    home_multiplier = float(np.exp(tilt))
+    away_multiplier = float(np.exp(-tilt))
+
+    base_grid = np.asarray(prediction.grid, dtype=np.float64)
+    home_goals, away_goals = np.indices(base_grid.shape)
+    weights = np.power(home_multiplier, home_goals) * np.power(away_multiplier, away_goals)
+    adjusted = base_grid * weights
+    total = float(adjusted.sum())
+    if not np.isfinite(total) or total <= 0:
+        return prediction, {"applied": False, "reason": "invalid adjusted grid"}
+    adjusted /= total
+
+    home_xg = float((adjusted * home_goals).sum())
+    away_xg = float((adjusted * away_goals).sum())
+    adjusted_prediction = FootballProbabilityGrid(adjusted, home_xg, away_xg, normalize=False)
+    return adjusted_prediction, {
+        "applied": True,
+        "source": lineup_1x2.get("source"),
+        "home_adjusted_value": home_value,
+        "away_adjusted_value": away_value,
+        "log_value_ratio": log_ratio,
+        "tilt": tilt,
+        "home_goal_multiplier": home_multiplier,
+        "away_goal_multiplier": away_multiplier,
+        "base_xg_home": float(prediction.home_goal_expectation),
+        "base_xg_away": float(prediction.away_goal_expectation),
+        "adjusted_xg_home": home_xg,
+        "adjusted_xg_away": away_xg,
+        "note": (
+            "Experimental capped lineup adjustment applied to the score grid. "
+            "All exact-score, totals, BTTS, single and combo probabilities are "
+            "summed from this adjusted grid."
+        ),
+    }
+
+
+def _kelly_fraction(probability: float, decimal_odds: float) -> float:
+    """Return full Kelly fraction for a simple decimal-odds wager."""
+    if probability <= 0 or decimal_odds <= 1:
+        return 0.0
+    edge = probability * decimal_odds - 1.0
+    if edge <= 0:
+        return 0.0
+    return max(0.0, edge / (decimal_odds - 1.0))
+
+
+def build_betting_decision(value_picks: list[dict], odds_available: bool) -> dict:
+    """Gate model picks into profit-oriented recommendations.
+
+    A high model probability is not the same as a profitable bet. This layer only
+    produces an actionable candidate when real market odds imply positive EV.
+    """
+    criteria = [
+        "Use real offered odds with provider timestamp.",
+        "Require model probability above the fair break-even probability.",
+        "Require expected value of at least +3%.",
+        "Prefer singles; same-game combo profit needs quoted combo odds.",
+        "Cap suggested fractional Kelly exposure at 1% bankroll.",
+    ]
+    if not odds_available:
+        return {
+            "status": "no_market_odds",
+            "grade": "NO BET",
+            "headline": "No profit recommendation",
+            "summary": (
+                "The model can show fair odds, but it cannot identify profit without real bookmaker odds."
+            ),
+            "criteria": criteria,
+            "candidates": [],
+            "limitations": [
+                "Most likely and most profitable are different goals.",
+                "Do not treat fair odds as offered odds.",
+            ],
+        }
+
+    candidates = []
+    for pick in value_picks:
+        prob = float(pick.get("prob") or 0.0)
+        odds = pick.get("market_odds")
+        ev = pick.get("expected_value")
+        if odds is None or ev is None:
+            continue
+        fair = (1.0 / prob) if prob > 0 else None
+        edge = float(ev)
+        if edge < 0.03:
+            continue
+        full_kelly = _kelly_fraction(prob, float(odds))
+        capped_fractional_kelly = min(full_kelly * 0.25, 0.01)
+        candidates.append(
+            {
+                "id": pick.get("id"),
+                "selection": pick.get("selection"),
+                "market": pick.get("market"),
+                "probability": prob,
+                "fair_odds": fair,
+                "market_odds": float(odds),
+                "bookmaker": pick.get("bookmaker"),
+                "expected_value": edge,
+                "edge_percent": edge * 100.0,
+                "full_kelly_fraction": full_kelly,
+                "suggested_bankroll_fraction": capped_fractional_kelly,
+                "suggested_bankroll_percent": capped_fractional_kelly * 100.0,
+                "confidence": (
+                    "VALUE CANDIDATE"
+                    if edge >= 0.08 and prob >= 0.50
+                    else "WATCHLIST"
+                ),
+            }
+        )
+    candidates.sort(key=lambda row: (row["expected_value"], row["probability"]), reverse=True)
+    if not candidates:
+        return {
+            "status": "no_positive_edge",
+            "grade": "NO BET",
+            "headline": "No positive-EV single found",
+            "summary": (
+                "Matched odds are available, but none clear the +3% expected-value gate."
+            ),
+            "criteria": criteria,
+            "candidates": [],
+            "limitations": ["Passing on a fixture is a valid model output."],
+        }
+    top = candidates[0]
+    return {
+        "status": "value_candidate",
+        "grade": top["confidence"],
+        "headline": top["selection"],
+        "summary": (
+            f"Top value candidate: {top['selection']} at {top['market_odds']:.2f} "
+            f"({top['expected_value']:.1%} EV). Suggested exposure is capped."
+        ),
+        "criteria": criteria,
+        "candidates": candidates[:3],
+        "limitations": [
+            "This is model-based expected value, not a guaranteed profit.",
+            "Stake sizing is educational and capped; it is not personal financial advice.",
+            "Refresh odds before acting because prices move.",
+        ],
+    }
+
+
 def build_prediction(
     league_id: str,
     home: str,
@@ -2026,11 +2860,15 @@ def build_prediction(
         away = fixture["away"]
         fixture_id = fixture.get("fixture_id") or fixture_id
         kickoff = fixture.get("kickoff") or kickoff
-        forecast_kind = (
-            "upcoming_fixture"
-            if fixture.get("status") in {"scheduled", "live"}
-            else "completed_fixture"
-        )
+        status = fixture.get("status")
+        if status == "live":
+            forecast_kind = "live_fixture"
+        elif status == "scheduled":
+            forecast_kind = "upcoming_fixture"
+        elif status in {"postponed", "cancelled"}:
+            forecast_kind = f"{status}_fixture"
+        else:
+            forecast_kind = "completed_fixture"
     elif fixture_id and kickoff:
         # Client supplied a dated fixture identity even if live fixture lookup failed.
         try:
@@ -2050,19 +2888,28 @@ def build_prediction(
     cutoff = training_cutoff(kickoff)
     state = get_league_state(league_id, cutoff=cutoff)
     teams = state["teams"]
-    if home not in teams or away not in teams:
+    # Prefer catalog names; UEFA newcomers may only exist on the fixture list.
+    catalog_teams = teams
+    if state["league"]["id"] in UEFA_COMP_IDS:
+        try:
+            catalog_teams = sorted(set(teams) | set(get_league_catalog(league_id)["teams"]))
+        except Exception:
+            catalog_teams = teams
+    mapped_home = map_to_catalog(home, catalog_teams) or home
+    mapped_away = map_to_catalog(away, catalog_teams) or away
+    home, away = mapped_home, mapped_away
+    if home == away:
+        raise ValueError("Choose two different teams.")
+    fitted = set(teams)
+    prior_teams = [name for name in (home, away) if name not in fitted]
+    if prior_teams and state["league"]["id"] not in UEFA_COMP_IDS:
         raise ValueError(
             "Use team names from the selected season catalog. "
             f"{home!r} / {away!r} not both in {state['league']['season_label']}."
         )
-    if home == away:
-        raise ValueError("Choose two different teams.")
 
-    prediction = predict_score_grid(state["model"], home, away)
-    ranked = top_scores(prediction)
-    combo_bundle = best_combos(prediction, home, away)
-    singles = rank_single_selections(prediction, home, away, limit=3)
-    result_side, result_label, result_prob = predicted_1x2(prediction, home, away)
+    base_prediction = predict_score_grid(state["model"], home, away)
+    prediction = base_prediction
     matches = state["trainable"]
     h2h = matches[
         ((matches["home"] == home) & (matches["away"] == away))
@@ -2086,6 +2933,126 @@ def build_prediction(
             "and is not included numerically in the Dixon–Coles forecast."
         ),
     }
+    impact_layer = _empty_impact_layer()
+    fotmob_match_id = (fixture or {}).get("match_id")
+    if not fotmob_match_id and fixture_id and ":" in str(fixture_id):
+        fotmob_match_id = str(fixture_id).rsplit(":", 1)[-1]
+    fotmob_impact = fotmob_match_impact(fotmob_match_id)
+    if (fotmob_impact.get("lineups") or {}).get("available"):
+        fotmob_lineups = fotmob_impact["lineups"]
+        lineup = {
+            "status": "Available",
+            "source": "FotMob",
+            "retrieved_at": now.isoformat(),
+            "included_in_model": False,
+            "teams": fotmob_lineups.get("teams") or [],
+            "note": (
+                "FotMob match details provide lineup context. It is not included "
+                "numerically in the Dixon–Coles/Elo forecast yet."
+            ),
+        }
+        impact_layer["lineups"] = {
+            **fotmob_lineups,
+            "retrieved_at": now.isoformat(),
+        }
+    if (fotmob_impact.get("injuries") or {}).get("available"):
+        impact_layer["injuries"] = {
+            **fotmob_impact["injuries"],
+            "retrieved_at": now.isoformat(),
+        }
+    api_enrichment = api_football.enrich_fixture(league_id, home, away, kickoff)
+    if (api_enrichment.get("lineups") or {}).get("available") and not impact_layer["lineups"].get("available"):
+        lineup = {
+            "status": "Available",
+            "source": "API-Football",
+            "retrieved_at": now.isoformat(),
+            "included_in_model": False,
+            "teams": (api_enrichment.get("lineups") or {}).get("teams") or [],
+            "note": (
+                "API-Football lineup context is displayed separately. It is not included "
+                "numerically in the Dixon–Coles forecast unless a validated lineup-aware "
+                "extension is added later."
+            ),
+        }
+        impact_layer["lineups"] = {
+            "available": True,
+            "source": "API-Football",
+            "retrieved_at": now.isoformat(),
+            "included_in_model": False,
+            "teams": (api_enrichment.get("lineups") or {}).get("teams") or [],
+        }
+    if (api_enrichment.get("injuries") or {}).get("available") and not impact_layer["injuries"].get("available"):
+        impact_layer["injuries"] = {
+            "available": True,
+            "source": "API-Football",
+            "retrieved_at": now.isoformat(),
+            "included_in_model": False,
+            "players": (api_enrichment.get("injuries") or {}).get("players") or [],
+            "note": (
+                "Availability data is displayed as context only. It is not converted "
+                "into a numeric probability adjustment yet."
+            ),
+        }
+    elo_model = ensemble.fit_elo(matches)
+    elo_1x2 = ensemble.elo_1x2(elo_model, home, away)
+    market_1x2 = ensemble.market_1x2_from_offers(api_enrichment.get("odds"))
+    lineup_1x2 = ensemble.lineup_availability_1x2(impact_layer)
+    prediction, lineup_grid_adjustment = apply_lineup_to_score_grid(base_prediction, lineup_1x2)
+    if lineup_1x2:
+        lineup["included_in_model"] = bool(lineup_grid_adjustment.get("applied"))
+        lineup["note"] = (
+            "Provider lineup/availability values are included through a small capped experimental "
+            "score-grid adjustment. This is not a fully trained player-impact model."
+        )
+        impact_layer["included_in_model"] = True
+        impact_layer["status"] = "included_score_grid"
+        impact_layer["summary"] = (
+            "Lineups/availability are included through a small capped experimental score-grid adjustment. "
+            "Exact score, totals, BTTS, singles and combos are summed from that adjusted grid."
+        )
+        if impact_layer["lineups"].get("available"):
+            impact_layer["lineups"]["included_in_model"] = True
+        if impact_layer["injuries"].get("available"):
+            impact_layer["injuries"]["included_in_model"] = True
+    ranked = top_scores(prediction)
+    combo_bundle = best_combos(prediction, home, away)
+    singles = rank_single_selections(prediction, home, away, limit=3)
+    dc_result_side, dc_result_label, dc_result_prob = predicted_1x2(prediction, home, away)
+    base_dc_result_side, base_dc_result_label, base_dc_result_prob = predicted_1x2(base_prediction, home, away)
+    base_dc_1x2 = {
+        "home_win": float(base_prediction.home_win),
+        "draw": float(base_prediction.draw),
+        "away_win": float(base_prediction.away_win),
+        "predicted_result": base_dc_result_side,
+        "predicted_result_label": base_dc_result_label,
+        "predicted_result_prob": base_dc_result_prob,
+    }
+    dc_1x2 = {
+        "home_win": float(prediction.home_win),
+        "draw": float(prediction.draw),
+        "away_win": float(prediction.away_win),
+        "predicted_result": dc_result_side,
+        "predicted_result_label": dc_result_label,
+        "predicted_result_prob": dc_result_prob,
+    }
+    value_picks = [
+        {
+            **pick,
+            "fair_odds": pick.get("fair_odds"),
+            "market_odds": None,
+            "bookmaker": None,
+            "expected_value": None,
+            "value_status": "unavailable",
+        }
+        for pick in singles
+    ]
+    value_picks = api_football.apply_odds_to_picks(value_picks, api_enrichment.get("odds"))
+    odds_available = any(pick.get("market_odds") is not None for pick in value_picks)
+    betting_decision = build_betting_decision(value_picks, odds_available)
+    # Lineup is already folded into the score grid above; do not blend it a
+    # second time as an independent 1X2 signal.
+    blended_1x2 = ensemble.blend_1x2(dc_1x2, elo_1x2, market_1x2, None)
+    result_side, result_label, result_prob = predicted_1x2_from_probs(blended_1x2, home, away)
 
     freshness = {
         "forecast_generated_at": now.isoformat(),
@@ -2110,19 +3077,39 @@ def build_prediction(
                 "role": "anytime scorer/assist display only",
                 "ttl_seconds": PLAYER_TTL,
             },
+            {
+                "name": "API-Football",
+                "role": "optional odds and lineup context; lineup can adjust the score grid when values are available",
+                "ttl_seconds": api_football.ODDS_TTL,
+                "configured": bool(api_enrichment.get("configured")),
+                "status": api_enrichment.get("status"),
+            },
         ],
         "lineup_status": lineup["status"],
-        "lineup_retrieved_at": None,
+        "lineup_retrieved_at": lineup.get("retrieved_at"),
     }
 
     limitations = [
         "Regulation time only (plus stoppage). Extra time and penalties are excluded.",
         "Player anytime probabilities use season FotMob xG/xA shares × team λ; they do not alter the match score grid.",
-        "No bookmaker odds feed: fair odds are shown; value is unavailable.",
+        (
+            "API-Football bookmaker odds are used only for value comparison when matched; they do not alter probabilities."
+            if odds_available
+            else "No matched bookmaker odds feed: fair odds are shown; value is unavailable."
+        ),
         TRACKING_NOTE,
         lineup["note"],
         home_form.get("note"),
     ]
+    if prior_teams:
+        limitations.insert(
+            0,
+            (
+                "No finished "
+                f"{state['league']['name']} results yet for {', '.join(prior_teams)}; "
+                "using competition-average attack/defense priors (not a form reading)."
+            ),
+        )
 
     result = {
         "fixture_id": fixture_id,
@@ -2135,6 +3122,29 @@ def build_prediction(
         "kickoff": kickoff,
         "venue": (fixture or {}).get("venue"),
         "fixture_status": (fixture or {}).get("status"),
+        "fixture_minute": (fixture or {}).get("minute"),
+        "fixture_score": (fixture or {}).get("score"),
+        "forecast_label": (
+            "Live match"
+            if forecast_kind == "live_fixture"
+            else (
+                "Upcoming fixture forecast"
+                if forecast_kind == "upcoming_fixture"
+                else (
+                    "Completed fixture"
+                    if forecast_kind == "completed_fixture"
+                    else (
+                        "Postponed fixture"
+                        if forecast_kind == "postponed_fixture"
+                        else (
+                            "Cancelled fixture"
+                            if forecast_kind == "cancelled_fixture"
+                            else "Hypothetical matchup"
+                        )
+                    )
+                )
+            )
+        ),
         "home_logo": lookup_crest(league_id, home) or (fixture or {}).get("home_logo"),
         "away_logo": lookup_crest(league_id, away) or (fixture or {}).get("away_logo"),
         "trained_on": state["trained_on"],
@@ -2148,12 +3158,35 @@ def build_prediction(
         "xg_definition": (
             "Dixon–Coles team expected goals (λ), not observed shot-based xG."
         ),
-        "home_win": float(prediction.home_win),
-        "draw": float(prediction.draw),
-        "away_win": float(prediction.away_win),
+        "home_win": float(blended_1x2["home_win"]),
+        "draw": float(blended_1x2["draw"]),
+        "away_win": float(blended_1x2["away_win"]),
         "predicted_result": result_side,
         "predicted_result_label": result_label,
         "predicted_result_prob": result_prob,
+        "headline_model": "Ensemble 1X2",
+        "score_grid_model": (
+            "Lineup-adjusted Dixon-Coles"
+            if lineup_grid_adjustment.get("applied")
+            else "Dixon-Coles"
+        ),
+        "ensemble": {
+            "home_win": float(blended_1x2["home_win"]),
+            "draw": float(blended_1x2["draw"]),
+            "away_win": float(blended_1x2["away_win"]),
+            "predicted_result": result_side,
+            "predicted_result_label": result_label,
+            "predicted_result_prob": result_prob,
+            "signals": blended_1x2["signals"],
+            "status": blended_1x2["status"],
+            "note": blended_1x2["note"],
+        },
+        "dixon_coles_1x2": dc_1x2,
+        "base_dixon_coles_1x2": base_dc_1x2,
+        "elo_1x2": elo_1x2,
+        "lineup_1x2": lineup_1x2,
+        "lineup_grid_adjustment": lineup_grid_adjustment,
+        "market_implied_1x2": market_1x2,
         "btts": float(prediction.btts_yes),
         "over_15": float(prediction.total_goals("over", 1.5)),
         "over_25": float(prediction.total_goals("over", 2.5)),
@@ -2164,7 +3197,7 @@ def build_prediction(
         ],
         "views": {
             "most_likely": {
-                "objective": "Rank supported selections by model event probability.",
+                "objective": "Headline result uses the ensemble. Singles/combos are score-grid markets from Dixon-Coles.",
                 "single_picks": singles,
                 "combo_2leg": combo_bundle["combo_2leg"],
                 "combo_3leg": combo_bundle["combo_3leg"],
@@ -2175,20 +3208,19 @@ def build_prediction(
                     "Expected return using offered decimal odds. "
                     "Distinct from most-likely probability ranking."
                 ),
-                "status": "unavailable",
-                "reason": "No bookmaker/provider odds feed with timestamp is configured.",
-                "single_picks": [
-                    {
-                        **pick,
-                        "fair_odds": pick.get("fair_odds"),
-                        "market_odds": None,
-                        "expected_value": None,
-                        "value_status": "unavailable",
-                    }
-                    for pick in singles
-                ],
+                "status": "available" if odds_available else "unavailable",
+                "source": "API-Football" if api_enrichment.get("configured") else None,
+                "last_update": (api_enrichment.get("odds") or {}).get("last_update"),
+                "reason": (
+                    "Ranked by expected return using matched API-Football odds."
+                    if odds_available
+                    else (api_enrichment.get("note") or "No matched bookmaker/provider odds are available.")
+                ),
+                "single_picks": value_picks,
+                "value_candidates": betting_decision.get("candidates") or [],
             },
         },
+        "betting_decision": betting_decision,
         "single_picks": singles,
         "combos": [],
         "combo_2leg": combo_bundle["combo_2leg"],
@@ -2197,6 +3229,8 @@ def build_prediction(
         "high_risk": None,
         "combo_note": combo_bundle["combo_note"],
         "grid_diagnostics": combo_bundle["diagnostics"],
+        "external_data": api_enrichment,
+        "impact_layer": impact_layer,
         "recent_form": {"home": home_form, "away": away_form},
         "home_form": home_venue,
         "away_form": away_venue,
@@ -2222,15 +3256,27 @@ def build_prediction(
         **dixon_coles_meta(state["model"]),
         "inputs": [
             "penaltyblog DixonColesGoalModel",
+            "Elo 1X2 strength rating",
+            (
+                "FotMob/API lineup availability score-grid adjustment"
+                if lineup_grid_adjustment.get("applied")
+                else "no lineup/availability score-grid adjustment"
+            ),
             f"time-decay ξ={DEFAULT_XI}",
             "matches strictly before forecast cutoff",
             "football-data.co.uk / FotMob finished results",
+            (
+                "market-implied 1X2 odds when API-Football has all three prices"
+                if market_1x2
+                else "no market-implied 1X2 input for this fixture"
+            ),
         ],
         "inputs_not_in_model": [
             "recent-form summary cards",
             "head-to-head list",
-            "lineups / injuries / suspensions",
-            "bookmaker odds",
+            *([] if lineup_grid_adjustment.get("applied") else ["lineups / injuries / suspensions"]),
+            "player club form and attacking contribution context",
+            "bookmaker odds, which only power value comparison when available",
         ],
     }
 
@@ -2238,6 +3284,50 @@ def build_prediction(
     if fixture_id and kickoff and forecast_kind == "upcoming_fixture":
         save_info = forecast_store.save_live_forecast(fixture_id, result)
         result["forecast_saved"] = save_info
+    elif fixture_id and kickoff and forecast_kind == "live_fixture":
+        forecast_store.freeze_at_kickoff(fixture_id, kickoff)
+        frozen = forecast_store.get_frozen(fixture_id)
+        result["forecast_kind_note"] = (
+            "Match is in progress. Any probabilities below are a saved pre-match "
+            "forecast, not an in-play model update. Training ignores the live score."
+        )
+        if frozen and forecast_store.forecast_looks_sane(frozen):
+            result["forecast_label"] = "Pre-match forecast"
+            result["pre_match_forecast"] = {
+                "frozen_at": frozen.get("frozen_at"),
+                "predicted_result_label": frozen.get("predicted_result_label"),
+                "predicted_result_prob": frozen.get("predicted_result_prob"),
+                "home_win": frozen.get("home_win"),
+                "draw": frozen.get("draw"),
+                "away_win": frozen.get("away_win"),
+                "exact_scores": frozen.get("exact_scores"),
+                "xg_home": frozen.get("xg_home"),
+                "xg_away": frozen.get("xg_away"),
+            }
+            # Prefer frozen 1X2 for display when available.
+            for key in (
+                "predicted_result",
+                "predicted_result_label",
+                "predicted_result_prob",
+                "home_win",
+                "draw",
+                "away_win",
+                "exact_scores",
+                "xg_home",
+                "xg_away",
+                "single_picks",
+                "combo_2leg",
+                "combo_3leg",
+                "views",
+            ):
+                if frozen.get(key) is not None:
+                    result[key] = frozen[key]
+        else:
+            result["forecast_label"] = "Live match — current model (no valid pre-match snapshot)"
+            result["forecast_kind_note"] = (
+                "No usable pre-match forecast was locked for this fixture. "
+                "Showing the current Dixon–Coles grid (not an in-play model)."
+            )
     elif fixture_id and kickoff:
         forecast_store.freeze_at_kickoff(fixture_id, kickoff)
         if fixture and fixture.get("finished") and fixture.get("score"):
@@ -2256,6 +3346,7 @@ def build_prediction(
         if frozen and frozen.get("settlement"):
             result["settlement"] = frozen["settlement"]
         elif frozen:
+            result["forecast_label"] = "Pre-match forecast"
             result["frozen_pre_kickoff"] = {
                 "frozen_at": frozen.get("frozen_at"),
                 "predicted_result_label": frozen.get("predicted_result_label"),
@@ -2279,6 +3370,7 @@ def build_prediction(
     away_team = match_team(away, names)
     if home_team is None or away_team is None:
         result["player_note"] = f"Could not map teams to player stats ({home} / {away})."
+        result["impact_layer"]["player_form"]["note"] = result["player_note"]
         return result
 
     result["player_source"] = f"FotMob {players['season'].iloc[0]}"
@@ -2299,5 +3391,22 @@ def build_prediction(
                 players, away_team, prediction.away_goal_expectation, "assist", 2
             )
         ),
+    }
+    result["impact_layer"]["player_form"] = {
+        "available": True,
+        "source": result["player_source"],
+        "included_in_model": False,
+        "note": (
+            "Player attacking contribution is displayed from FotMob season xG/xA/goals/assists. "
+            "It does not change the match probability until a validated player-impact model is trained."
+        ),
+        "home": {
+            "team": home_team,
+            "contributors": _pack_player_context(players, home_team),
+        },
+        "away": {
+            "team": away_team,
+            "contributors": _pack_player_context(players, away_team),
+        },
     }
     return result

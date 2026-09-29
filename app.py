@@ -6,13 +6,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import forecasts as forecast_store
+from model_quality import evaluate_league, evaluate_league_cached, evaluation_overview
 from engine import (
     LEAGUES,
     build_prediction,
+    get_browse_board,
     get_fixtures,
     get_league_catalog,
     get_live_board,
     league_by_id,
+    nav_leagues,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -34,9 +37,29 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/api/nav")
+def nav():
+    return nav_leagues()
+
+
 @app.get("/api/live")
 def live(tz: str | None = None):
     return get_live_board(tz)
+
+
+@app.get("/api/home")
+def home(date: str | None = None, tz: str | None = None, scope: str = "all"):
+    """Home browse board: dated panels. scope=main|other|all for progressive load."""
+    return get_browse_board(date_str=date, tz_name=tz, scope=scope)
+
+
+@app.get("/api/browse/{league_id}")
+def browse_league(league_id: str, date: str | None = None, tz: str | None = None):
+    try:
+        league_by_id(league_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown league") from None
+    return get_browse_board(date_str=date, tz_name=tz, league_id=league_id)
 
 
 @app.get("/api/leagues")
@@ -50,6 +73,30 @@ def leagues():
         }
         for league in LEAGUES
     ]
+
+
+@app.get("/api/evaluation")
+def evaluation(limit_leagues: int = 6):
+    return evaluation_overview(limit_leagues=max(1, min(limit_leagues, len(LEAGUES))))
+
+
+@app.get("/api/evaluation/{league_id}")
+def evaluation_league(league_id: str, refresh: bool = False):
+    try:
+        league_by_id(league_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown league") from None
+    if refresh:
+        evaluate_league_cached.cache_clear()
+    try:
+        return evaluate_league(league_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not evaluate model ({error}). Try a smaller league/sample later.",
+        ) from error
 
 
 @app.get("/api/leagues/{league_id}/teams")
